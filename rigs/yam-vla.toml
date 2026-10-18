@@ -1,0 +1,98 @@
+# MolmoAct2-BimanualYAM on its own GPU server (a workstation, or a Jetson Thor next to the
+# rig) drives a two-arm YAM rig (two I2RT YAM arms with LINEAR_4310 grippers, a RealSense
+# D435i overhead, a D405 on each wrist) through the YAM /act client. Everything for this
+# setup is in this file:
+#
+#   uv run abstract robot check --config rigs/yam-vla.toml
+#   uv run abstract robot run --config rigs/yam-vla.toml "Fold the cloth"
+#
+# Every run moves real arms and needs an operator at the rig. The model runs on its own
+# server, so there is no spend meter. For your rig or a variant, copy this file to
+# *.local.toml (gitignored) and edit the copy: at least server_url and the camera serials.
+#
+# Camera and control settings follow AllenAI's reference inference code for this
+# checkpoint (github.com/williamtsai726/YAM, linked from the MolmoAct2 README):
+# gello_software/gello/cameras/realsense_camera.py streams 640x360 colour and converts it
+# to RGB; experiments/launch_yaml_eval_molmoact.py runs at 30 Hz from start_joints all
+# zeros with grippers open, plays every action of each chunk, and sends raw i2rt joint
+# positions as state. The model card's sample frames are 640x360 too.
+
+[vla]
+policy = "molmoact2" # or "gr00t"
+# The /act server: examples/yam/host_server_yam.py --port 8202 in a MolmoAct2 checkout.
+# On another machine: http://<policy-host>:8202.
+server_url = "http://127.0.0.1:8202"
+
+[vla.args]
+# Must equal the embodiment's cam size; the client's 224x224 default is replaced by the
+# reference's 640x360.
+cam_width = 640
+cam_height = 360
+
+[rig]
+# The robot's name in the runs store (the API's robot; the bucket's key prefix).
+name = "yam-1"
+# Where runs are written; default $XDG_DATA_HOME/abstract/robot/runs, else
+# ~/.local/share/abstract/robot/runs. Relative paths resolve against this file.
+# log_root = "/var/lib/abstract/robot/runs"
+# 2 minutes at 30 Hz.
+max_steps = 3600
+
+[rig.embodiment]
+# yam_arms arguments. Both CAN channels are required: which interface drives which arm
+# depends on how the rig is wired. Here the right arm is on can0 (a gs_usb adapter) and
+# the left on can1 (a CANable2 through slcand, rigs/canable-slcan/), the reverse of
+# yam_arms' defaults. Check yours with holdcheck, one arm at a time, before a run.
+left_channel = "can1"
+right_channel = "can0"
+gripper_type = "LINEAR_4310"
+control_interface = "joints"
+control_hz = 30
+# Hold pose stiffly between chunks (the default is compliant).
+zero_gravity_mode = false
+rest_secs = 6.0
+motor_temp_limit = 70
+# Real joint limits instead of yam_arms' +/-pi placeholders: i2rt's YAM model
+# (_load_joint_limits_from_xml), without the 0.15 rad buffer i2rt adds for its own
+# connect-time check. Grippers 0 (closed) to 1 (open). Left arm, then right arm.
+joint_low = [-2.618, 0.0, 0.0, -1.693, -1.5708, -2.0944, 0.0, -2.618, 0.0, 0.0, -1.693, -1.5708, -2.0944, 0.0]
+joint_high = [3.1416, 3.6652, 3.1416, 1.5708, 1.5708, 2.0944, 1.0, 3.1416, 3.6652, 3.1416, 1.5708, 1.5708, 2.0944, 1.0]
+# Joint mode is where yam_arms' collision guardrail works, but its default arm-base
+# geometry is a placeholder. Off until collision_*_base_pos and the table height are
+# measured.
+collision_guardrail = false
+# librealsense serials of your cameras (placeholders here; the USB descriptor serials
+# differ). `rs-enumerate-devices -s` lists them, and so does `abstract robot check` when
+# one is missing. Confirm the wrist sides by covering one wrist camera and checking which
+# frame goes dark.
+top_depth_serial = "000000000001"
+left_depth_serial = "000000000002"
+right_depth_serial = "000000000003"
+realsense_capture = "process"
+depth_fps = 15
+# The reference's 640x360: the full 16:9 sensor view (640x480 is a 4:3 crop of it).
+capture_width = 640
+capture_height = 360
+cam_width = 640
+cam_height = 360
+# A D435i on a USB 2 link offers no 640x360 mode. There, capture 1280x720 colour (the
+# same 16:9 view, resized to 640x360) with 480x270 depth, about 12 fps:
+# top_capture_width = 1280
+# top_capture_height = 720
+# top_depth_capture_width = 480
+# top_depth_capture_height = 270
+
+# Where finished runs go. Without [store], runs stay in log_root. With it, each finished
+# run is uploaded and then deleted locally (one line per run stays in
+# <log_root>/runs.jsonl). See docs/ROBOT.md, "Where runs go".
+#
+# The Abstract runs API, under the account of ABSTRACT_API_KEY or of `abstract login`'s key:
+# [store]
+# route = "abstract"
+#
+# Or an R2 bucket you own, written over its S3 API, with R2_ACCOUNT_ID,
+# R2_RUNS_ACCESS_KEY_ID and R2_RUNS_SECRET_ACCESS_KEY in env_file (chmod 600):
+# [store]
+# route = "bucket"
+# bucket = "my-robot-runs"
+# env_file = "~/.config/abstract/r2.env"

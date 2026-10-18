@@ -1,0 +1,895 @@
+"""Configuration for the YAM embodiment and the generic ``/act`` policy client.
+
+Both configs are frozen dataclasses. The client defaults match MolmoAct2's
+first-party bimanual-YAM server, so zero-arg construction "just works". Each
+exposes ``from_kwargs`` so the adapters can accept flat scalar keyword
+arguments. This is what lets ``abstract robot run -P server_url=...
+-E left_channel=...`` configure them, since the CLI only
+forwards scalar ``key=value`` pairs.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import warnings
+from dataclasses import dataclass
+from typing import Any, TypeVar
+
+import numpy as np
+import numpy.typing as npt
+
+from abstract_harness.robot.core.spaces import (
+    ActionSemantics,
+    Box,
+    CameraSpec,
+    ObservationSpace,
+    StateField,
+    StateSpec,
+)
+from abstract_harness.robot.yam.packing import (
+    ARM_DOF,
+    DIM_LABELS,
+    DIM_PARTS,
+    STATE_KEY,
+    TOTAL_DIM,
+    state_spec,
+)
+from abstract_harness.robot.yam.poses import validate_pose_name
+
+_T = TypeVar("_T", bound="_FromKwargs")
+
+# The i2rt gripper variants this adapter supports. i2rt also defines NO_GRIPPER and
+# YAM_TEACHING_HANDLE, but those change the per-arm DOF and would silently break the
+# 7-D-per-arm / 14-D packing contract, so they are rejected eagerly. Names match the
+# ``i2rt.robots.utils.GripperType`` enum *names* (the enum values are lowercase).
+SUPPORTED_GRIPPER_TYPES = frozenset({"CRANK_4310", "LINEAR_3507", "LINEAR_4310", "FLEXIBLE_4310"})
+
+# Conservative default action limits: revolute joints in [-pi, pi], gripper in
+# [0, 1]. These are SAFETY limits — override with the real YAM joint limits before
+# trusting them on hardware.
+_ARM_LOW = (-np.pi,) * ARM_DOF + (0.0,)
+_ARM_HIGH = (np.pi,) * ARM_DOF + (1.0,)
+_DEFAULT_LOW = _ARM_LOW * 2
+_DEFAULT_HIGH = _ARM_HIGH * 2
+
+# Dataset-verified MolmoAct2-BimanualYAM start pose (2,260 episodes,
+# 2026-07-14 audit): joints within noise of encoder zero, both grippers open
+# in effectively every episode start. Joints match the physically captured
+# rest; the gripper slots are commanded open (1.0) rather than the captured
+# closed reading so episodes begin in the training distribution.
+# Assumes standard upright mounting; exotic mounts override per rig.
+_JOINT_HOME_ARM = (0.0,) * ARM_DOF + (1.0,)
+DEFAULT_JOINT_HOME_POSE: tuple[float, ...] = _JOINT_HOME_ARM * 2
+
+# Park target == home target: the next episode starts in distribution with
+# no gripper re-open transient. (Torque release after parking still lets
+# the arms sag slightly, and reset always re-runs the homing ramp.)
+DEFAULT_REST_POSE: tuple[float, ...] = DEFAULT_JOINT_HOME_POSE
+
+# Conservative default per-step displacement limits for joints_are_delta mode:
+# 0.2 rad per joint per step, a full normalized stroke per gripper per step.
+# Symmetric (the declared delta box is +/-step_limits) because opening and
+# closing require opposite-signed deltas. Reusing the absolute [0, 1] box here
+# would reject gripper motion in one direction.
+_STEP_ARM = (0.2,) * ARM_DOF + (1.0,)
+_DEFAULT_STEP_LIMITS = _STEP_ARM * 2
+
+EEF_DIM_LABELS: tuple[str, ...] = tuple(
+    f"{side}_{part}"
+    for side in ("left", "right")
+    for part in ("x", "y", "z", "yaw", "pitch", "roll", "gripper")
+)
+# Pitch and roll ship pinned at (0, 0): the axes exist in the layout but are
+# not commandable until an operator widens their bounds, which keeps default
+# behavior identical to the historical yaw-only interface.
+_EEF_ARM_LOW = (0.15, -0.25, 0.03, -np.pi, 0.0, 0.0, 0.0)
+_EEF_ARM_HIGH = (0.48, 0.25, 0.40, np.pi, 0.0, 0.0, 1.0)
+DEFAULT_EEF_LOW: tuple[float, ...] = _EEF_ARM_LOW * 2
+DEFAULT_EEF_HIGH: tuple[float, ...] = _EEF_ARM_HIGH * 2
+_EEF_YAW_INDICES = (3, 10)
+_EEF_PITCH_INDICES = (4, 11)
+_EEF_ROLL_INDICES = (5, 12)
+_EEF_ORIENTATION_PITCH = (-0.6, 0.6)
+_EEF_ORIENTATION_ROLL = (-np.pi / 2, np.pi / 2)
+_EEF_GRIPPER_INDICES = (6, 13)
+
+# Provisional 2026-07-14 LINEAR_4310 solution for EEF position (0.30, 0, 0.20),
+# jaw axis pitched 30 degrees from vertical toward the arm base, and open grippers.
+_EEF_HOME_ARM = (-0.024, 0.794, 0.645, -0.375, -0.021, -0.012, 1.0)
+DEFAULT_EEF_HOME_POSE: tuple[float, ...] = _EEF_HOME_ARM * 2
+
+
+class _FromKwargs:
+    """Mixin: build a frozen dataclass from flat scalar kwargs (CLI-friendly).
+
+    Fields named in ``_FLOAT_TUPLE_FIELDS`` additionally accept a
+    comma-separated string ("0.1,0.2,...") so pose-shaped tuples are
+    settable from ``-E key=value`` flags, which only carry scalars; the robot
+    TOML's lists arrive in that form too.
+    """
+
+    _FLOAT_TUPLE_FIELDS: frozenset[str] = frozenset()
+
+    @classmethod
+    def from_kwargs(cls: type[_T], **flat: Any) -> _T:
+        names = {f.name for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
+        unknown = set(flat) - names
+        if unknown:
+            raise TypeError(f"{cls.__name__} got unexpected config keys: {sorted(unknown)}")
+        for key in cls._FLOAT_TUPLE_FIELDS & set(flat):
+            value = flat[key]
+            if isinstance(value, str):
+                try:
+                    flat[key] = tuple(float(part) for part in value.split(","))
+                except ValueError:
+                    raise ValueError(
+                        f"{key} must be a comma-separated list of numbers, got {value!r}"
+                    ) from None
+        return cls(**flat)
+
+
+@dataclass(frozen=True)
+class YamConfig(_FromKwargs):
+    """Static configuration for a bimanual YAM embodiment."""
+
+    _FLOAT_TUPLE_FIELDS = frozenset(
+        {
+            "joint_low",
+            "joint_high",
+            "eef_low",
+            "eef_high",
+            "home_pose",
+            "rest_pose",
+            "step_limits",
+            "collision_left_base_pos",
+            "collision_right_base_pos",
+        }
+    )
+
+    left_channel: str = "can0"
+    right_channel: str = "can1"
+    gripper_type: str = "LINEAR_4310"
+    control_hz: float = 10.0
+    gripper_stroke_s: float = 1.0
+    cam_height: int = 224
+    cam_width: int = 224
+    # Native capture size requested from the camera before the resize to
+    # cam_width x cam_height. 640 x 480 is what every rig has used so far;
+    # raise it (e.g. 1920 x 1080) when a policy needs full-resolution frames,
+    # such as AprilTag detection of small tags. Applies to the RealSense paths
+    # (colour and depth streams; intrinsics scale from this size) and to the
+    # V4L2/OpenCV path (CAP_PROP_FRAME_WIDTH/HEIGHT).
+    capture_width: int = 640
+    capture_height: int = 480
+    # Optional separate size for the RealSense depth stream. None means "same
+    # as the colour capture". Depth is aligned to the colour frame, so a D435
+    # can run colour at 1920 x 1080 with depth at its 1280 x 720 maximum.
+    depth_capture_width: int | None = None
+    depth_capture_height: int | None = None
+    # Per-camera overrides of the two pairs above (plan 0033). None means "use
+    # the rig-wide value". A mixed rig can then run its D435 top camera at
+    # 1920 x 1080 while D405 wrists stay within their 1280 x 720 maximum.
+    # Depth overrides apply only to a slot with `{slot}_depth_serial`.
+    top_capture_width: int | None = None
+    top_capture_height: int | None = None
+    left_capture_width: int | None = None
+    left_capture_height: int | None = None
+    right_capture_width: int | None = None
+    right_capture_height: int | None = None
+    top_depth_capture_width: int | None = None
+    top_depth_capture_height: int | None = None
+    left_depth_capture_width: int | None = None
+    left_depth_capture_height: int | None = None
+    right_depth_capture_width: int | None = None
+    right_depth_capture_height: int | None = None
+    joint_low: tuple[float, ...] = _DEFAULT_LOW
+    joint_high: tuple[float, ...] = _DEFAULT_HIGH
+    control_interface: str = "joints"
+    # Operator-supplied rig-specific notes appended to the built-in agent docs.
+    docs_extra: str = ""
+    eef_low: tuple[float, ...] = DEFAULT_EEF_LOW
+    eef_high: tuple[float, ...] = DEFAULT_EEF_HIGH
+    ik_max_iters: int = 20
+    ik_step_joint_limit: float = 0.2
+    cmd_resync_threshold: float = 0.35
+    osc_deadband: float = 0.005
+    osc_reversals: int = 2
+    osc_window: int = 6
+    osc_hold_steps: int = 10
+    # Reset target; None selects the per-mode factory default
+    # (DEFAULT_JOINT_HOME_POSE / DEFAULT_EEF_HOME_POSE).
+    # Gripper slots are normalized 0-1 (1 = open).
+    home_pose: tuple[float, ...] | None = None
+    # Named joint-space alternative to home_pose, resolved from pose_dir on the
+    # first reset of each connection. Works in both control interfaces; in
+    # eef_pos mode the resolved pose must also start inside the EEF action box
+    # (FK grasp-point position, gripper aperture, and relative yaw/pitch/roll
+    # 0 are all checked against eef_low/eef_high before the homing ramp).
+    start_pose: str | None = None
+    pose_dir: str = "poses"
+    # Pose used to park on close() after reset() captures the initial pose. None
+    # opts out of the factory target and parks at that captured pose instead.
+    # Gripper slots are normalized 0-1 (1 = open).
+    rest_pose: tuple[float, ...] | None = DEFAULT_REST_POSE
+    rest_secs: float = 3.0
+    # Driver-native positions at the stroke endpoints. Wire gripper 1 maps to
+    # gripper_open, and wire gripper 0 maps to gripper_closed.
+    gripper_open: float = 1.0
+    gripper_closed: float = 0.0
+    joints_are_delta: bool = False
+    step_limits: tuple[float, ...] = _DEFAULT_STEP_LIMITS
+    zero_gravity_mode: bool = True
+    unattended: bool = False
+    # Skip both operator Enter gates in reset(): the stand-clear home gate is
+    # replaced by a printed one-line notice and homing begins immediately; the
+    # scene-ready gate is dropped and the episode starts right after the
+    # homing ramp. Every other attended behavior stays: status
+    # lines, the end-episode keypress, and operator grading. Stage the scene
+    # BEFORE launching the run (and between episodes, while answering the
+    # grading prompt). Requires an interactive terminal; reset()
+    # faults before any motion otherwise (headless runs want unattended).
+    # unattended=True takes precedence and makes this a no-op.
+    auto_start: bool = False
+    # Predictive MuJoCo checking is opt-out. Geometry overrides stay optional:
+    # None selects CollisionConfig's library default at contribution time.
+    collision_guardrail: bool = True
+    collision_left_base_pos: tuple[float, ...] | None = None
+    collision_right_base_pos: tuple[float, ...] | None = None
+    collision_left_base_yaw: float | None = None
+    collision_right_base_yaw: float | None = None
+    collision_table: bool = True
+    collision_table_height: float | None = None
+    collision_penetration_threshold: float | None = None
+    # Soft motor-temperature cutoff in degrees C. None disables both thermal
+    # gates; every arm and gripper slot uses the same conservative limit.
+    motor_temp_limit: float | None = None
+    # Warn once per trial this many degrees below the configured thermal limit.
+    motor_temp_warn_margin: float = 10.0
+    # Wait for the arm to reach each commanded pose before observing, so a
+    # chunked policy plans from a converged view. None disables the wait; a
+    # tolerance must exceed the rig's steady-state offset (run
+    # abstract robot holdcheck in the mode the trial will use) or every
+    # step burns settle_timeout_s. Presumes a position-holding servo, so pair
+    # with zero_gravity_mode=False.
+    settle_tolerance: float | None = None
+    settle_timeout_s: float = 1.0
+    # Timeouts per trial before settling gives up for the rest of that trial.
+    # Bounds worst-case wasted wall clock at budget * settle_timeout_s.
+    settle_timeout_budget: int = 20
+    # DEPRECATED fallback: framework-driven runs now supply the real horizon
+    # via the embodiment's bind_task hook, so the countdown needs no config.
+    # Only consulted when the hook never fires (direct rollout(), or a core
+    # that predates it). Display-only; bounds nothing. Removal in a later
+    # release.
+    max_steps_hint: int | None = None
+    # Builtin OpenCV camera sources: set a slot to its V4L2 color node (stable
+    # udev paths recommended; /dev/videoN reshuffles on replug).
+    # Plain strings, so `-E top_cam_device=...` and the robot TOML can carry them.
+    # Uses the base opencv-python-headless dependency.
+    top_cam_device: str | None = None
+    left_cam_device: str | None = None
+    right_cam_device: str | None = None
+    # Optional RealSense sources: setting `{slot}_depth_serial` hands that camera
+    # slot to librealsense, replacing V4L2/OpenCV for the slot and serving both
+    # its colour image and aligned depth plus intrinsics. Each slot takes exactly
+    # one source, `{slot}_cam_device` XOR `{slot}_depth_serial`; setting both is a
+    # config error (one streamer per device node). Either every slot must have a
+    # source or none may. Both the device serial from rs-enumerate-devices and
+    # the ASIC serial (`asic_serial_number`) in a /dev/v4l/by-id name are accepted.
+    # These are plain strings, set in [rig.embodiment] or with `-E`; the robot extra
+    # installs librealsense. Write serials as TOML strings: a number loses leading
+    # zeros.
+    top_depth_serial: str | None = None
+    left_depth_serial: str | None = None
+    right_depth_serial: str | None = None
+    # Capture all configured RealSense cameras in one spawn child by default,
+    # keeping librealsense and frame-copy work outside the motor-control
+    # interpreter. "inline" restores the prior in-process implementation as a
+    # debugging escape hatch.
+    realsense_capture: str = "process"
+    # Librealsense colour and depth stream rate. Both streams use the same rate;
+    # capture resolution remains fixed at 640x480. Valid range: 1 through 90,
+    # but devices only accept their discrete rates (D435/D405: 6/15/30/60/90);
+    # an unsupported rate fails at camera open with the librealsense error.
+    depth_fps: int = 30
+    # Opt-in raw estimated torque state. Kept off by default because adding a
+    # runtime observation key changes the policy-facing contract.
+    report_joint_eff: bool = False
+    # Parking before grading gives the grader an unobstructed final view, but it
+    # moves the arms. Rigs running tasks whose success state is the gripper
+    # holding an object must set this false; the framework then grades the last
+    # step's frames as before.
+    park_before_grade: bool = True
+    # Open default-pinned pitch/roll axes to conservative ranges. With this
+    # true, a 0,0 pitch/roll pin is widened; re-pin by setting this false or
+    # pinning at a nonzero epsilon.
+    eef_orientation: bool = False
+
+    @classmethod
+    def from_kwargs(cls, **flat: Any) -> YamConfig:
+        """Build CLI configuration while keeping boolean off-states explicit."""
+        for field in ("start_pose", "pose_dir"):
+            if field not in flat:
+                continue
+            # None means "unset" (e.g. -E start_pose=none), matching the
+            # depth-serial guard below, which also lets None through.
+            if flat[field] is None:
+                del flat[field]
+            elif not isinstance(flat[field], str):
+                raise ValueError(
+                    f"{field} must be a string; write it as a string in the robot TOML — "
+                    "a number may lose leading zeros"
+                )
+        for slot in ("top", "left", "right"):
+            field = f"{slot}_depth_serial"
+            if isinstance(flat.get(field), int):
+                raise ValueError(
+                    f"{field} must be a string; write the serial as a string in the robot "
+                    "TOML — a number loses leading zeros"
+                )
+        # The CLI parses the literal `none` to Python None, which is falsy: an
+        # unvalidated None here would silently flip a boolean off (opting out
+        # of a safety gate, removing the table plane, dropping the effort
+        # report, or suppressing the pre-grade park) instead of the "library
+        # default" that `none` means
+        # everywhere else.
+        for flag in (
+            "collision_guardrail",
+            "collision_table",
+            "report_joint_eff",
+            "park_before_grade",
+            "eef_orientation",
+        ):
+            if flag in flat and not isinstance(flat[flag], bool):
+                raise ValueError(f"{flag} must be true or false, got {flat[flag]!r}")
+        if "collision_table_height" in flat and flat["collision_table_height"] is None:
+            raise ValueError(
+                "collision_table_height cannot be none; use collision_table=false "
+                "to remove the table"
+            )
+        if "motor_temp_warn_margin" in flat and flat["motor_temp_warn_margin"] is None:
+            raise ValueError("motor_temp_warn_margin cannot be none; provide a non-negative value")
+        if flat.get("collision_table") is False and flat.get("collision_table_height") is not None:
+            raise ValueError(
+                "collision_table_height contradicts collision_table=false; remove the "
+                "height or set collision_table=true"
+            )
+        return super().from_kwargs(**flat)
+
+    @property
+    def depth_capture_size(self) -> tuple[int, int] | None:
+        """The rig-wide RealSense depth stream size, or None to match colour capture."""
+        if self.depth_capture_width is None or self.depth_capture_height is None:
+            return None
+        return (self.depth_capture_width, self.depth_capture_height)
+
+    @staticmethod
+    def _camera_slot(camera: str) -> str:
+        """Map a reader camera name (``top_cam``) or slot (``top``) to its slot."""
+        slot = camera[: -len("_cam")] if camera.endswith("_cam") else camera
+        if slot not in ("top", "left", "right"):
+            raise ValueError(f"unknown camera {camera!r}; expected top_cam, left_cam or right_cam")
+        return slot
+
+    def capture_size_for(self, camera: str) -> tuple[int, int]:
+        """Native colour capture size for one camera: its override, else rig-wide."""
+        slot = self._camera_slot(camera)
+        width = getattr(self, f"{slot}_capture_width")
+        height = getattr(self, f"{slot}_capture_height")
+        if width is not None and height is not None:
+            return (width, height)
+        return (self.capture_width, self.capture_height)
+
+    def depth_capture_size_for(self, camera: str) -> tuple[int, int]:
+        """Depth stream size for one camera, always resolved.
+
+        Order: the slot's depth override, the rig-wide depth size, then the
+        camera's own colour capture size.
+        """
+        slot = self._camera_slot(camera)
+        width = getattr(self, f"{slot}_depth_capture_width")
+        height = getattr(self, f"{slot}_depth_capture_height")
+        if width is not None and height is not None:
+            return (width, height)
+        return self.depth_capture_size or self.capture_size_for(camera)
+
+    def __post_init__(self) -> None:
+        """Reject values that violate the 14-D packing and hardware invariants.
+
+        Pose and step vectors must span both arms, every step limit must be
+        finite and positive, the gripper stroke must be nonzero, and every
+        builtin camera slot must have exactly one source or all must be unset.
+        """
+        if self.gripper_type not in SUPPORTED_GRIPPER_TYPES:
+            raise ValueError(
+                f"gripper_type {self.gripper_type!r} is not supported; expected one of "
+                f"{sorted(SUPPORTED_GRIPPER_TYPES)} (i2rt GripperType enum names)"
+            )
+        if not np.isfinite(self.gripper_stroke_s) or self.gripper_stroke_s <= 0:
+            raise ValueError("gripper_stroke_s must be finite and > 0")
+        if self.motor_temp_limit is not None and (
+            not np.isfinite(self.motor_temp_limit) or self.motor_temp_limit <= 0
+        ):
+            raise ValueError("motor_temp_limit must be finite and > 0 when set")
+        if not np.isfinite(self.motor_temp_warn_margin) or self.motor_temp_warn_margin < 0:
+            raise ValueError("motor_temp_warn_margin must be finite and >= 0")
+        if (
+            self.motor_temp_limit is not None
+            and self.motor_temp_warn_margin >= self.motor_temp_limit
+        ):
+            raise ValueError("motor_temp_warn_margin must be less than motor_temp_limit")
+        valid_interfaces = {"eef_pos", "joints"}
+        if self.control_interface not in valid_interfaces:
+            raise ValueError(
+                f"control_interface must be one of {sorted(valid_interfaces)}, "
+                f"got {self.control_interface!r}"
+            )
+        if self.control_interface == "eef_pos" and self.joints_are_delta:
+            raise ValueError(
+                "joints_are_delta=True is incompatible with control_interface='eef_pos'"
+            )
+        for name in ("joint_low", "joint_high"):
+            if len(getattr(self, name)) != TOTAL_DIM:
+                raise ValueError(f"{name} must have {TOTAL_DIM} entries")
+        for name in ("eef_low", "eef_high"):
+            if len(getattr(self, name)) != len(EEF_DIM_LABELS):
+                raise ValueError(f"{name} must have {len(EEF_DIM_LABELS)} entries")
+        if not isinstance(self.eef_orientation, bool):
+            raise ValueError(f"eef_orientation must be true or false, got {self.eef_orientation!r}")
+        if self.eef_orientation:
+            eef_low_values = list(self.eef_low)
+            eef_high_values = list(self.eef_high)
+            for index in _EEF_PITCH_INDICES:
+                if (eef_low_values[index], eef_high_values[index]) == (0.0, 0.0):
+                    eef_low_values[index], eef_high_values[index] = _EEF_ORIENTATION_PITCH
+            for index in _EEF_ROLL_INDICES:
+                if (eef_low_values[index], eef_high_values[index]) == (0.0, 0.0):
+                    eef_low_values[index], eef_high_values[index] = _EEF_ORIENTATION_ROLL
+            object.__setattr__(self, "eef_low", tuple(eef_low_values))
+            object.__setattr__(self, "eef_high", tuple(eef_high_values))
+        eef_low = self.eef_low_array
+        eef_high = self.eef_high_array
+        if not np.all(np.isfinite(eef_low)) or not np.all(np.isfinite(eef_high)):
+            raise ValueError("eef_low and eef_high must contain only finite values")
+        # Equality pins an axis (not commandable, action_box masks its
+        # max_step declaration); only an inverted pair is a config error.
+        if np.any(eef_low > eef_high):
+            raise ValueError("eef_low must not exceed eef_high in any dimension")
+        for yaw_index in (*_EEF_YAW_INDICES, *_EEF_ROLL_INDICES):
+            if eef_low[yaw_index] < -np.pi or eef_high[yaw_index] > np.pi:
+                raise ValueError("eef yaw and roll bounds must stay within [-pi, pi]")
+        # The relative-rotation ZYX extraction is singular at |pitch| = pi/2;
+        # keeping pitch bounds strictly inside guarantees every commandable
+        # orientation decomposes uniquely.
+        for pitch_index in _EEF_PITCH_INDICES:
+            if eef_low[pitch_index] <= -np.pi / 2 or eef_high[pitch_index] >= np.pi / 2:
+                raise ValueError("eef pitch bounds must stay strictly inside (-pi/2, pi/2)")
+        if (
+            not isinstance(self.ik_max_iters, int)
+            or isinstance(self.ik_max_iters, bool)
+            or self.ik_max_iters <= 0
+        ):
+            raise ValueError("ik_max_iters must be a positive integer")
+        for name in ("ik_step_joint_limit", "cmd_resync_threshold"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and > 0")
+        if not np.isfinite(self.osc_deadband) or self.osc_deadband < 0:
+            raise ValueError("osc_deadband must be finite and >= 0")
+        if (
+            not isinstance(self.osc_reversals, int)
+            or isinstance(self.osc_reversals, bool)
+            or self.osc_reversals < 0
+        ):
+            raise ValueError("osc_reversals must be a non-negative integer")
+        if (
+            not isinstance(self.osc_window, int)
+            or isinstance(self.osc_window, bool)
+            or self.osc_window <= 0
+        ):
+            raise ValueError("osc_window must be a positive integer")
+        if self.osc_reversals >= self.osc_window:
+            raise ValueError("osc_reversals must be less than osc_window")
+        if (
+            not isinstance(self.osc_hold_steps, int)
+            or isinstance(self.osc_hold_steps, bool)
+            or self.osc_hold_steps <= 0
+        ):
+            raise ValueError("osc_hold_steps must be a positive integer")
+        if self.settle_tolerance is not None and (
+            not np.isfinite(self.settle_tolerance) or self.settle_tolerance <= 0
+        ):
+            raise ValueError("settle_tolerance must be finite and > 0")
+        if not np.isfinite(self.settle_timeout_s) or self.settle_timeout_s <= 0:
+            raise ValueError("settle_timeout_s must be finite and > 0")
+        if (
+            not isinstance(self.settle_timeout_budget, int)
+            or isinstance(self.settle_timeout_budget, bool)
+            or self.settle_timeout_budget < 1
+        ):
+            raise ValueError("settle_timeout_budget must be a positive integer")
+        if self.home_pose is not None and len(self.home_pose) != TOTAL_DIM:
+            raise ValueError(f"home_pose must have {TOTAL_DIM} entries")
+        if self.start_pose is not None and self.home_pose is not None:
+            raise ValueError("start_pose and home_pose are mutually exclusive; set only one key")
+        if self.start_pose is not None:
+            try:
+                validate_pose_name(self.start_pose)
+            except ValueError as exc:
+                raise ValueError(f"invalid start_pose: {exc}") from None
+        if not isinstance(self.pose_dir, str) or not self.pose_dir.strip():
+            raise ValueError("pose_dir must be a non-empty string")
+        if self.rest_pose is not None and len(self.rest_pose) != TOTAL_DIM:
+            raise ValueError(f"rest_pose must have {TOTAL_DIM} entries")
+        if self.rest_secs <= 0:
+            raise ValueError("rest_secs must be > 0")
+        if self.max_steps_hint is not None and self.max_steps_hint < 1:
+            raise ValueError("max_steps_hint must be >= 1")
+        for key in ("capture_width", "capture_height"):
+            value = getattr(self, key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 16:
+                raise ValueError(f"{key} must be an integer of at least 16")
+        depth_pair = (self.depth_capture_width, self.depth_capture_height)
+        if (depth_pair[0] is None) != (depth_pair[1] is None):
+            raise ValueError("depth_capture_width and depth_capture_height must be set together")
+        for key in ("depth_capture_width", "depth_capture_height"):
+            value = getattr(self, key)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 16
+            ):
+                raise ValueError(f"{key} must be an integer of at least 16 or unset")
+        for slot in ("top", "left", "right"):
+            for kind in ("capture", "depth_capture"):
+                w_key, h_key = f"{slot}_{kind}_width", f"{slot}_{kind}_height"
+                pair = (getattr(self, w_key), getattr(self, h_key))
+                if (pair[0] is None) != (pair[1] is None):
+                    raise ValueError(f"{w_key} and {h_key} must be set together")
+                for key, value in ((w_key, pair[0]), (h_key, pair[1])):
+                    if value is not None and (
+                        not isinstance(value, int) or isinstance(value, bool) or value < 16
+                    ):
+                        raise ValueError(f"{key} must be an integer of at least 16 or unset")
+            if (
+                getattr(self, f"{slot}_depth_capture_width") is not None
+                and getattr(self, f"{slot}_depth_serial") is None
+            ):
+                raise ValueError(
+                    f"{slot}_depth_capture_width/height only apply to a RealSense slot; "
+                    f"set {slot}_depth_serial or remove the depth override"
+                )
+        valid_realsense_capture = {"inline", "process"}
+        if self.realsense_capture not in valid_realsense_capture:
+            raise ValueError(
+                "realsense_capture must be one of "
+                f"{sorted(valid_realsense_capture)}, got {self.realsense_capture!r}"
+            )
+        if (
+            not isinstance(self.depth_fps, int)
+            or isinstance(self.depth_fps, bool)
+            or not 1 <= self.depth_fps <= 90
+        ):
+            raise ValueError("depth_fps must be an integer from 1 to 90")
+        camera_source_fields = tuple(
+            f"{slot}_{suffix}"
+            for slot in ("top", "left", "right")
+            for suffix in ("cam_device", "depth_serial")
+        )
+        for field in camera_source_fields:
+            value = getattr(self, field)
+            if value is not None and not value.strip():
+                raise ValueError(f"{field} must be a non-empty string")
+        cam_device_fields: dict[str, str] = {}
+        for slot in ("top", "left", "right"):
+            field = f"{slot}_cam_device"
+            device = getattr(self, field)
+            if device is None:
+                continue
+            previous = cam_device_fields.get(device)
+            if previous is not None:
+                raise ValueError(
+                    f"{previous} and {field} must be different; duplicate camera device {device!r}"
+                )
+            cam_device_fields[device] = field
+        depth_serial_fields: dict[str, str] = {}
+        for slot in ("top", "left", "right"):
+            field = f"{slot}_depth_serial"
+            serial = getattr(self, field)
+            if serial is None:
+                continue
+            previous = depth_serial_fields.get(serial)
+            if previous is not None:
+                raise ValueError(
+                    f"{previous} and {field} must be different; duplicate depth serial {serial!r}"
+                )
+            depth_serial_fields[serial] = field
+        for slot in ("top", "left", "right"):
+            if getattr(self, f"{slot}_cam_device") is not None and (
+                getattr(self, f"{slot}_depth_serial") is not None
+            ):
+                raise ValueError(
+                    f"{slot}_cam_device and {slot}_depth_serial are mutually "
+                    f"exclusive: a RealSense camera opened through librealsense "
+                    f"cannot also be opened through V4L2 (one streamer per node)"
+                )
+        sourced = {
+            slot
+            for slot in ("top", "left", "right")
+            if getattr(self, f"{slot}_cam_device") is not None
+            or getattr(self, f"{slot}_depth_serial") is not None
+        }
+        if sourced and len(sourced) != 3:
+            unsourced = ", ".join(slot for slot in ("top", "left", "right") if slot not in sourced)
+            raise ValueError(
+                f"camera sources must be set for all slots or none; unsourced slots: {unsourced}"
+            )
+        if len(self.step_limits) != TOTAL_DIM or any(
+            not (s > 0) or not np.isfinite(s) for s in self.step_limits
+        ):
+            raise ValueError(f"step_limits must be {TOTAL_DIM} finite positive entries")
+        if self.gripper_open == self.gripper_closed:
+            raise ValueError(
+                "gripper_open and gripper_closed must differ (the gripper stroke "
+                "would be zero and observations could not be normalized)"
+            )
+        # Settling waits for the arm to hold a commanded pose, which the
+        # gravity-compensated default mode does not promise: a compliant rig may
+        # drift instead. Left as a warning rather than an error because whether a
+        # given rig holds well enough is an empirical question holdcheck answers,
+        # not one the config can decide.
+        if self.settle_tolerance is not None and self.zero_gravity_mode:
+            warnings.warn(
+                "settle_tolerance is set while zero_gravity_mode is True. Settling "
+                "presumes a position-holding servo, and the gravity-compensated "
+                "mode may drift instead of holding, which would exhaust "
+                "settle_timeout_budget on every trial. Run "
+                "abstract robot holdcheck in this mode to check, or set "
+                "zero_gravity_mode = false in [rig.embodiment].",
+                UserWarning,
+                stacklevel=2,
+            )
+        # Last, after every validation: an invalid config raises without ever
+        # warning. FutureWarning (not DeprecationWarning) so operators running
+        # the console script actually see it under Python's default filters.
+        if self.max_steps_hint is not None:
+            warnings.warn(
+                "max_steps_hint is deprecated: framework-driven runs supply the "
+                "real horizon via the bind_task hook, so the countdown needs no "
+                "config. The hint is only used when the hook never fires "
+                "(direct rollout(), or a core that predates it).",
+                FutureWarning,
+                stacklevel=2,
+            )
+
+    @property
+    def low(self) -> npt.NDArray[np.float64]:
+        """Return absolute lower bounds in radians and normalized gripper units."""
+        return np.asarray(self.joint_low, dtype=np.float64)
+
+    @property
+    def high(self) -> npt.NDArray[np.float64]:
+        """Return absolute upper bounds in radians and normalized gripper units."""
+        return np.asarray(self.joint_high, dtype=np.float64)
+
+    @property
+    def gripper_max_step(self) -> float | None:
+        """Return the normalized gripper change allowed per control step."""
+        if not np.isfinite(self.control_hz):
+            return None
+        hz = self.control_hz if self.control_hz > 0 else 10.0
+        stroke_steps = self.gripper_stroke_s * hz
+        if not np.isfinite(stroke_steps) or stroke_steps <= 0:
+            return None
+        max_step = 1.0 / stroke_steps
+        if not np.isfinite(max_step):
+            return None
+        return min(1.0, max_step)
+
+    @property
+    def delta_low(self) -> npt.NDArray[np.float64]:
+        """Return negative per-step limits in radians and normalized gripper units."""
+        return -np.asarray(self.step_limits, dtype=np.float64)
+
+    @property
+    def delta_high(self) -> npt.NDArray[np.float64]:
+        """Return positive per-step limits in radians and normalized gripper units."""
+        return np.asarray(self.step_limits, dtype=np.float64)
+
+    @property
+    def eef_low_array(self) -> npt.NDArray[np.float64]:
+        """Return Cartesian lower bounds in metres, radians, and gripper units."""
+        return np.asarray(self.eef_low, dtype=np.float64)
+
+    @property
+    def eef_high_array(self) -> npt.NDArray[np.float64]:
+        """Return Cartesian upper bounds in metres, radians, and gripper units."""
+        return np.asarray(self.eef_high, dtype=np.float64)
+
+    def pinned_orientation_labels(self) -> tuple[str, ...]:
+        """Return EEF yaw, pitch, and roll labels whose bounds pin the axis."""
+        orientation_indices = frozenset(
+            (*_EEF_YAW_INDICES, *_EEF_PITCH_INDICES, *_EEF_ROLL_INDICES)
+        )
+        return tuple(
+            label
+            for index, label in enumerate(EEF_DIM_LABELS)
+            if index in orientation_indices and self.eef_low[index] == self.eef_high[index]
+        )
+
+
+@dataclass(frozen=True)
+class ActServerConfig(_FromKwargs):
+    """Static configuration for the generic ``/act`` policy client.
+
+    ``num_steps`` is the wire-protocol field of the same name: the number of
+    flow-matching **denoising steps** the server runs per inference
+    (``predict_action(num_steps=...)`` → ``flow_matching_num_steps``). It does
+    NOT control how many actions come back. ``action_horizon`` is the
+    checkpoint's advertised chunk length, surfaced as
+    ``PolicyConfig`` metadata; the actual length is
+    always taken from the server's response. Its 30-step default belongs to
+    MolmoAct2's bimanual-YAM checkpoint. ``name`` labels the policy in eval logs.
+    ``remedy`` is a free-text recovery instruction that core shows as its own
+    ``hint:`` line after connection failures. The default carries the canonical
+    MolmoAct2 launch command; override it with the rig's own recipe
+    (``-P remedy='run ~/my/launch.sh'``) or pass an empty string to omit the
+    line.
+    """
+
+    server_url: str = "http://127.0.0.1:8202"
+    joints_are_delta: bool = False
+    endpoint: str = "/act"
+    num_steps: int = 10
+    action_horizon: int = 30
+    timeout_s: float = 30.0
+    camera_order: tuple[str, ...] = ("top_cam", "left_cam", "right_cam")
+    state_key: str = "joint_pos"
+    cam_height: int = 224
+    cam_width: int = 224
+    name: str = "molmoact2"
+    # Last on purpose: appending keeps positional construction of the fields
+    # above meaning what it always has. No port in the text: the hint's
+    # previous line already names the configured server_url.
+    remedy: str = (
+        "start the MolmoAct2 /act server from its checkout: "
+        "python examples/yam/host_server_yam.py (docs: docs/ROBOT.md#vla-runs)"
+    )
+
+    @property
+    def url(self) -> str:
+        """Join the server and endpoint with exactly one separating slash."""
+        return self.server_url.rstrip("/") + "/" + self.endpoint.lstrip("/")
+
+
+MolmoActConfig = ActServerConfig
+
+
+DEFAULT_CAMERAS: tuple[str, ...] = ("top_cam", "left_cam", "right_cam")
+
+
+def action_semantics(
+    joints_are_delta: bool = False,
+    *,
+    control_interface: str = "joints",
+    gripper_max_step: float | None = None,
+) -> ActionSemantics:
+    """The action *semantics* both the policy and the embodiment declare.
+
+    Compatibility checking compares control_mode + rotation_repr (errors) and
+    gripper + frame (warnings). Building both sides here keeps those fields
+    aligned and makes a delta/absolute mismatch loud. ``max_step`` may differ
+    between the embodiment and policy because compatibility deliberately
+    excludes it. ``dim_labels`` names the action dimensions so label-addressed
+    tooling (e.g. the LLM agent policy) can move joints by name.
+    """
+    if control_interface == "eef_pos":
+        max_step = (
+            tuple(
+                gripper_max_step if index in _EEF_GRIPPER_INDICES else None
+                for index in range(len(EEF_DIM_LABELS))
+            )
+            if gripper_max_step is not None
+            else None
+        )
+        return ActionSemantics(
+            control_mode="eef_abs_pose",
+            rotation_repr="none",
+            gripper="continuous",
+            frame="base",
+            dim_labels=EEF_DIM_LABELS,
+            max_step=max_step,
+            # Seven dims per arm, as EEF_DIM_LABELS lays them out.
+            dim_parts=DIM_PARTS,
+        )
+    max_step = (
+        tuple(gripper_max_step if index in (6, 13) else None for index in range(TOTAL_DIM))
+        if gripper_max_step is not None and not joints_are_delta
+        else None
+    )
+    return ActionSemantics(
+        control_mode="joint_delta" if joints_are_delta else "joint_pos",
+        rotation_repr="none",
+        gripper="continuous",
+        frame="base",
+        dim_labels=DIM_LABELS,
+        max_step=max_step,
+        dim_parts=DIM_PARTS,
+    )
+
+
+def camera_specs(height: int, width: int, names: tuple[str, ...]) -> tuple[CameraSpec, ...]:
+    """Build CameraSpecs for the given names at one resolution (single source of truth)."""
+    return tuple(CameraSpec(name=n, height=height, width=width, channels=3) for n in names)
+
+
+def action_box(
+    low: npt.NDArray[np.float64] | None = None,
+    high: npt.NDArray[np.float64] | None = None,
+    *,
+    joints_are_delta: bool = False,
+    control_interface: str = "joints",
+    gripper_max_step: float | None = None,
+) -> Box:
+    """Build the selected joint or Cartesian action space with optional limits.
+
+    The embodiment supplies bounds while the policy may leave them unset. Joint
+    delta mode uses per-step displacement limits; all other modes use absolute
+    limits. A gripper dimension pinned by its bounds (``low == high``) declines
+    its ``max_step`` declaration — core rejects declarations on pinned
+    dimensions, and a config that constructs without the declaration must keep
+    constructing with it.
+    """
+    semantics = action_semantics(
+        joints_are_delta,
+        control_interface=control_interface,
+        gripper_max_step=gripper_max_step,
+    )
+    if semantics.max_step is not None and low is not None and high is not None:
+        pinned = np.asarray(low).reshape(-1) == np.asarray(high).reshape(-1)
+        masked = tuple(
+            None if (entry is not None and bool(pinned[index])) else entry
+            for index, entry in enumerate(semantics.max_step)
+        )
+        if masked != semantics.max_step:
+            semantics = dataclasses.replace(
+                semantics,
+                max_step=None if all(entry is None for entry in masked) else masked,
+            )
+    return Box(
+        shape=((len(EEF_DIM_LABELS),) if control_interface == "eef_pos" else (TOTAL_DIM,)),
+        low=low,
+        high=high,
+        semantics=semantics,
+    )
+
+
+def observation_space(
+    height: int,
+    width: int,
+    names: tuple[str, ...],
+    state_key: str = STATE_KEY,
+    *,
+    control_interface: str = "joints",
+) -> ObservationSpace:
+    """Build the camera and proprioception contract for the selected interface.
+
+    ``state_key`` drives *both* ``state_keys`` and the ``StateSpec`` field key so
+    joint mode stays internally consistent for any configured key. Cartesian
+    mode additionally declares its 14-D ``eef_state`` reference.
+    """
+    state = state_spec(state_key)
+    if control_interface == "eef_pos":
+        state = StateSpec(
+            fields=(
+                *state.fields,
+                StateField(
+                    key="eef_state",
+                    shape=(len(EEF_DIM_LABELS),),
+                    unit="m+rad+normalized",
+                ),
+            )
+        )
+    return ObservationSpace(
+        cameras=camera_specs(height, width, names),
+        state_keys=state.keys,
+        state=state,
+    )

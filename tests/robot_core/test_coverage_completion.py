@@ -1,0 +1,556 @@
+"""Targeted tests closing the remaining coverage gaps to reach 100%.
+
+Each test names the behavior it exercises; together with the rest of the suite
+these drive line + branch coverage of ``abstract_harness.robot.core`` to 100% (enforced by
+``--cov-fail-under=100``).
+"""
+
+from __future__ import annotations
+
+import functools
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import abstract_harness.robot.core.controller as controller_mod
+import abstract_harness.robot.core.registry as reg
+from abstract_harness.robot.config import parse_value as _parse_value
+from abstract_harness.robot.core import eval
+from abstract_harness.robot.core.approver import AutoApprover, ClampApprover
+from abstract_harness.robot.core.commands import _parse_kvs
+from abstract_harness.robot.core.compat import check_compatibility
+from abstract_harness.robot.core.controller import (
+    DefaultController,
+    EnsemblingController,
+    SmoothingController,
+)
+from abstract_harness.robot.core.embodiment import EmbodimentInfo
+from abstract_harness.robot.core.errors import EmbodimentFault, PolicyError
+from abstract_harness.robot.core.eval import _git_commit, _should_fail
+from abstract_harness.robot.core.log import EvalLog, EvalResults, EvalSpec, EvalStats
+from abstract_harness.robot.core.logging.sink import NullSink
+from abstract_harness.robot.core.mock import CubePickEmbodiment, NoopPolicy, ScriptedPolicy
+from abstract_harness.robot.core.policy import PolicyConfig, PolicyInfo
+from abstract_harness.robot.core.registry import register, registered, resolve
+from abstract_harness.robot.core.rollout import StepRecord, TrialRecord, rollout
+from abstract_harness.robot.core.scene import ListSceneDataset, Scene
+from abstract_harness.robot.core.scorer import min_distance_to_goal, success_at_end, value_to_float
+from abstract_harness.robot.core.spaces import ActionSemantics, Box, ObservationSpace
+from abstract_harness.robot.core.task import Task
+from abstract_harness.robot.core.transcript import (
+    approval_event,
+    operator_event,
+    operator_message_event,
+)
+from abstract_harness.robot.core.types import Action, ActionChunk, Observation, StepResult
+
+from .conftest import main
+
+_SCENE = Scene(id="s", instruction="reach", init_seed=0)
+_CUBE_SEM = ActionSemantics(control_mode="eef_delta_pos", frame="world")
+
+
+def _task(*scenes: Scene, max_steps: int = 10) -> Task:
+    return Task(
+        name="t",
+        scenes=list(scenes) or [_SCENE],
+        scorer=success_at_end(),
+        max_steps=max_steps,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# approver
+# --------------------------------------------------------------------------- #
+def test_clamp_approver_passthrough_when_unbounded() -> None:
+    approver = ClampApprover(Box(shape=(2,)))  # no low/high
+    action = Action(data=np.array([9.0, 9.0]))
+    assert approver.review(action, {}) is action
+
+
+def test_clamp_approver_passthrough_when_in_bounds() -> None:
+    approver = ClampApprover(Box(shape=(2,), low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0])))
+    action = Action(data=np.array([0.5, -0.5]))
+    assert approver.review(action, {}) is action
+
+
+# --------------------------------------------------------------------------- #
+# cli
+# --------------------------------------------------------------------------- #
+def test_parse_value_variants() -> None:
+    assert _parse_value("true") is True
+    assert _parse_value("false") is False
+    assert _parse_value("none") is None
+    assert _parse_value("null") is None
+    assert _parse_value("7") == 7
+    assert _parse_value("1.5") == 1.5
+    assert _parse_value("hello") == "hello"
+
+
+def test_parse_value_quoted_strings_bypass_coercion() -> None:
+    # The escape hatch for strings the heuristics would claim: quoted values
+    # come back as the literal inner string, uncoerced.
+    assert _parse_value("'none'") == "none"
+    assert _parse_value('"none"') == "none"
+    assert _parse_value("'7'") == "7"
+    assert _parse_value("'true'") == "true"
+    assert _parse_value("''") == ""
+    # Mismatched or single quotes are not treated as wrapping.
+    assert _parse_value("'none\"") == "'none\""
+    assert _parse_value("'") == "'"
+    assert _parse_value("don't") == "don't"
+
+
+def test_parse_kvs_rejects_bad_pair() -> None:
+    with pytest.raises(SystemExit):
+        _parse_kvs(["no-equals-sign"])
+
+
+def test_cli_inspect_error_log(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    log = EvalLog(
+        version=1,
+        status="error",
+        eval=EvalSpec(task="t", policy="p", embodiment="e", created="x", harness_version="0"),
+        results=EvalResults(total_scenes=0, total_trials=0),
+        stats=EvalStats(started_at="a", completed_at="b", duration_s=0.0, total_steps=0),
+        samples=(),
+        error="boom",
+    )
+    path = tmp_path / "err.json"
+    path.write_text(json.dumps(log.to_dict()), encoding="utf-8")
+    assert main(["inspect", str(path)]) == 1
+    assert "error: boom" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# controller
+# --------------------------------------------------------------------------- #
+def test_controller_validation_raises() -> None:
+    with pytest.raises(ValueError):
+        DefaultController(replan_interval=0)
+    with pytest.raises(ValueError):
+        SmoothingController(DefaultController(), alpha=0.0)
+    with pytest.raises(ValueError):
+        EnsemblingController(Box(shape=(2,), semantics=_CUBE_SEM), m=-1.0)
+
+
+def test_ensembling_warns_per_instance() -> None:
+    # No global warn-once state: every instance constructed without semantics
+    # warns, independent of construction order elsewhere in the process.
+    with pytest.warns(RuntimeWarning):
+        EnsemblingController(Box(shape=(2,)))
+    with pytest.warns(RuntimeWarning):
+        EnsemblingController(Box(shape=(2,)))
+
+
+def test_default_controller_records_actual_buffered_count() -> None:
+    # replan_interval larger than the chunk: the recorded per-inference count is
+    # the number of actions actually buffered, not the requested interval.
+    policy = ScriptedPolicy(chunk_size=4)
+    embodiment = CubePickEmbodiment()
+    obs = embodiment.reset(_SCENE, seed=0)
+    store: dict[str, object] = {}
+    DefaultController(replan_interval=10).next_action(policy, obs, 0, store)
+    inferences = store[controller_mod._INFER_KEY]
+    assert inferences[-1][1] == 4  # type: ignore[index]
+
+
+# --------------------------------------------------------------------------- #
+# eval helpers + halt path
+# --------------------------------------------------------------------------- #
+def test_git_commit_handles_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> object:
+        raise OSError("no git here")
+
+    monkeypatch.setattr("subprocess.run", boom)
+    assert _git_commit() is None
+
+
+def test_git_commit_nonzero_returncode(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Result:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Result())
+    assert _git_commit() is None
+
+
+def test_should_fail_branches() -> None:
+    assert _should_fail(True, 1, 1) is True
+    assert _should_fail(2, 2, 5) is True
+    assert _should_fail(2, 1, 5) is False
+
+
+class _FaultEmbodiment(CubePickEmbodiment):
+    def step(self, action: Action) -> StepResult:
+        raise EmbodimentFault("motor stalled")
+
+
+def test_eval_halts_on_embodiment_fault(tmp_path: Path) -> None:
+    task = _task(
+        Scene(id="s0", instruction="x", init_seed=0),
+        Scene(id="s1", instruction="x", init_seed=1),
+    )
+    (log,) = eval(task, ScriptedPolicy(), _FaultEmbodiment(), log_dir=str(tmp_path))
+    assert log.status == "error"
+    assert log.results.metrics == {}  # no scene was scored before the halt
+
+
+# --------------------------------------------------------------------------- #
+# mock world / policies
+# --------------------------------------------------------------------------- #
+def test_cubepick_close() -> None:
+    CubePickEmbodiment().close()
+
+
+def test_noop_policy_never_succeeds(tmp_path: Path) -> None:
+    (log,) = eval(_task(max_steps=8), NoopPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert log.results.metrics["success_at_end"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# scorer
+# --------------------------------------------------------------------------- #
+def test_value_to_float_string_paths() -> None:
+    assert value_to_float("3.5") == 3.5
+    assert value_to_float("not-a-number") == 0.0
+
+
+def test_min_distance_without_signal() -> None:
+    record = TrialRecord(
+        scene_id="s",
+        epoch=0,
+        seed=0,
+        steps=[
+            StepRecord(
+                t=0,
+                observation=Observation(),
+                action=Action(data=np.zeros(2)),
+                result=StepResult(observation=Observation(), info={}),
+            )
+        ],
+    )
+    assert min_distance_to_goal()(record, None).value == float("inf")
+
+
+# --------------------------------------------------------------------------- #
+# rollout
+# --------------------------------------------------------------------------- #
+class _PolicyErrorPolicy:
+    def __init__(self) -> None:
+        self.info = PolicyInfo(name="perr", action_space=Box(shape=(2,), semantics=_CUBE_SEM))
+        self.config = PolicyConfig()
+
+    def reset(self, scene: Scene) -> None:
+        return None
+
+    def act(self, observation: Observation) -> ActionChunk:
+        raise PolicyError("typed failure")
+
+
+def _rollout(policy: object, embodiment: object):  # type: ignore[no-untyped-def]
+    return rollout(
+        policy,  # type: ignore[arg-type]
+        embodiment,  # type: ignore[arg-type]
+        _SCENE,
+        max_steps=20,
+        seed=0,
+        epoch=0,
+        controller=DefaultController(),
+        approver=AutoApprover(),
+        sink=NullSink(),
+    )
+
+
+def test_rollout_reraises_typed_policy_error() -> None:
+    with pytest.raises(PolicyError, match="typed failure"):
+        _rollout(_PolicyErrorPolicy(), CubePickEmbodiment())
+
+
+def test_rollout_reraises_typed_embodiment_fault() -> None:
+    with pytest.raises(EmbodimentFault, match="motor stalled"):
+        _rollout(ScriptedPolicy(), _FaultEmbodiment())
+
+
+class _TruncatingEmbodiment(CubePickEmbodiment):
+    def step(self, action: Action) -> StepResult:
+        result = super().step(action)
+        return StepResult(
+            observation=result.observation,
+            reward=result.reward,
+            terminated=False,
+            truncated=True,
+            info=result.info,
+        )
+
+
+def test_rollout_truncation_path() -> None:
+    record = _rollout(ScriptedPolicy(), _TruncatingEmbodiment())
+    assert record.truncated is True
+    assert record.termination_reason == "truncated"
+
+
+# --------------------------------------------------------------------------- #
+# scene dataset
+# --------------------------------------------------------------------------- #
+def test_list_scene_dataset() -> None:
+    ds = ListSceneDataset([Scene(id="a", instruction="x"), Scene(id="b", instruction="y")])
+    assert len(ds) == 2
+    assert [s.id for s in ds] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------- #
+# transcript helpers
+# --------------------------------------------------------------------------- #
+def test_transcript_event_helpers() -> None:
+    assert approval_event(1, modified=True, detail="clamped").kind == "approval"
+    assert operator_event(2, "success").data["verdict"] == "success"
+    assert operator_message_event(3, "typed feedback").data == {
+        "text": "typed feedback",
+        "source": "console",
+    }
+    assert operator_message_event(4, "spoken feedback", "voice").data == {
+        "text": "spoken feedback",
+        "source": "voice",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# logging sink
+# --------------------------------------------------------------------------- #
+def test_null_sink_lifecycle() -> None:
+    sink = NullSink()
+    obs = Observation()
+    record = TrialRecord(scene_id="s", epoch=0, seed=0)
+    sink.on_eval_start(None)  # type: ignore[arg-type]
+    sink.on_trial_start("s", 0)
+    sink.log_step(0, obs, Action(data=np.zeros(2)), StepResult(observation=obs))
+    sink.on_trial_end(record)
+    sink.on_eval_end(None)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# registry error paths
+# --------------------------------------------------------------------------- #
+def test_register_unknown_kind() -> None:
+    with pytest.raises(ValueError, match="unknown registry kind"):
+        register("bogus")
+
+
+def test_register_without_resolvable_name() -> None:
+    nameless = functools.partial(lambda: None)  # partials have no __name__
+    with pytest.raises(ValueError, match="cannot determine"):
+        register("policy")(nameless)
+
+
+def test_registered_unknown_kind() -> None:
+    with pytest.raises(ValueError, match="unknown registry kind"):
+        registered("bogus")
+
+
+def test_entrypoint_load_failure_is_skipped_with_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _BadEP:
+        name = "broken"
+        value = "module:broken"
+
+        def load(self) -> object:
+            raise RuntimeError("import blew up")
+
+    monkeypatch.setattr(
+        reg,
+        "bundled",
+        lambda kind: [_BadEP()] if kind == "policy" else [],
+    )
+    monkeypatch.setattr(reg, "_loaded_bundled", False)
+    # A broken plugin must not crash discovery — but must not vanish silently.
+    with pytest.warns(RuntimeWarning, match="failed to load bundled policy 'broken'"):
+        names = registered("policy")
+    assert "broken" not in names
+
+
+def test_resolve_forwards_kwargs() -> None:
+    policy = resolve("policy", "scripted", chunk_size=9)
+    assert policy.chunk_size == 9
+
+
+# --------------------------------------------------------------------------- #
+# compatibility: every issue branch
+# --------------------------------------------------------------------------- #
+class _CfgPolicy:
+    def __init__(
+        self,
+        action_space: Box,
+        *,
+        obs: ObservationSpace | None = None,
+        control_hz: float | None = None,
+    ) -> None:
+        self.info = PolicyInfo(
+            name="cfg",
+            action_space=action_space,
+            observation_space=obs or ObservationSpace(),
+            control_hz=control_hz,
+        )
+        self.config = PolicyConfig()
+
+    def reset(self, scene: Scene) -> None:
+        return None
+
+    def act(self, observation: Observation) -> ActionChunk:
+        return ActionChunk(actions=[Action(data=np.zeros(self.info.action_space.dim))])
+
+
+def test_compat_semantics_unknown_warns() -> None:
+    report = check_compatibility(_CfgPolicy(Box(shape=(2,))), CubePickEmbodiment())
+    assert any(i.code == "action_semantics_unknown" for i in report.warnings)
+
+
+def test_compat_rotation_repr_mismatch() -> None:
+    box = Box(
+        shape=(2,), semantics=ActionSemantics("eef_delta_pos", rotation_repr="rot6d", frame="world")
+    )
+    report = check_compatibility(_CfgPolicy(box), CubePickEmbodiment())
+    assert any(i.code == "rotation_repr" for i in report.errors)
+
+
+def test_compat_gripper_and_frame_errors() -> None:
+    gripper_box = Box(
+        shape=(2,), semantics=ActionSemantics("eef_delta_pos", gripper="continuous", frame="world")
+    )
+    assert any(
+        i.code == "gripper"
+        for i in check_compatibility(_CfgPolicy(gripper_box), CubePickEmbodiment()).errors
+    )
+    frame_box = Box(shape=(2,), semantics=ActionSemantics("eef_delta_pos", frame="base"))
+    assert any(
+        i.code == "frame"
+        for i in check_compatibility(_CfgPolicy(frame_box), CubePickEmbodiment()).errors
+    )
+
+
+def test_compat_control_rate_warning() -> None:
+    box = Box(shape=(2,), semantics=_CUBE_SEM)
+    report = check_compatibility(_CfgPolicy(box, control_hz=5.0), CubePickEmbodiment())
+    assert any(i.code == "control_rate" for i in report.warnings)
+
+
+def test_compat_scene_setup_realizability() -> None:
+    emb = CubePickEmbodiment()
+    emb.info = EmbodimentInfo(
+        name=emb.info.name,
+        action_space=emb.info.action_space,
+        observation_space=emb.info.observation_space,
+        control_hz=emb.info.control_hz,
+        is_simulated=True,
+        supported_setups=frozenset({"layout_a"}),
+    )
+    task = _task(Scene(id="s", instruction="x", setup="layout_b"))
+    report = check_compatibility(ScriptedPolicy(), emb, task)
+    assert any(i.code == "scene_setup" for i in report.errors)
+
+
+# --------------------------------------------------------------------------- #
+# scorer reducers (median, pass@k edge cases)
+# --------------------------------------------------------------------------- #
+def test_reduce_median() -> None:
+    from abstract_harness.robot.core.scorer import Score, reduce_scores
+
+    assert (
+        reduce_scores("median", [Score(value=1.0), Score(value=3.0), Score(value=9.0)]).value == 3.0
+    )
+
+
+def test_pass_at_k_edge_cases() -> None:
+    from abstract_harness.robot.core.scorer import Score, get_reducer, pass_at_k, reduce_scores
+
+    for invalid_k in (0, -1, True, False, 2.5):
+        with pytest.raises(ValueError, match="k must be an integer >= 1"):
+            pass_at_k(invalid_k)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="needs at least"):
+        reduce_scores("pass_at_5", [Score(value=True), Score(value=False)])
+    with pytest.raises(ValueError, match="invalid pass@k"):
+        get_reducer("pass_at_notanint")
+
+
+# --------------------------------------------------------------------------- #
+# RerunSink — exercise the rerun-present logging path with fake backends
+# --------------------------------------------------------------------------- #
+def _fake_rerun_module(calls: list[str], paths: list[str], *, new_api: bool) -> object:
+    import types
+
+    fake = types.ModuleType("rerun")
+    fake.init = lambda *a, **k: calls.append("init")  # type: ignore[attr-defined]
+    fake.save = lambda p: calls.append("save")  # type: ignore[attr-defined]
+    fake.log = lambda path, *a, **k: paths.append(path)  # type: ignore[attr-defined]
+    fake.Image = lambda img: ("Image",)  # type: ignore[attr-defined]
+    fake.TextLog = lambda t: ("TextLog", t)  # type: ignore[attr-defined]
+    if new_api:  # rerun-sdk >= 0.23 surface
+        fake.set_time = lambda *a, **k: calls.append("time")  # type: ignore[attr-defined]
+        fake.Scalars = lambda v: ("Scalars", v)  # type: ignore[attr-defined]
+    else:  # older SDK surface
+        fake.set_time_sequence = lambda *a: calls.append("time")  # type: ignore[attr-defined]
+        fake.Scalar = lambda v: ("Scalar", v)  # type: ignore[attr-defined]
+    return fake
+
+
+def test_rerun_sink_logs_with_fake_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import sys
+
+    calls: list[str] = []
+    paths: list[str] = []
+    monkeypatch.setitem(sys.modules, "rerun", _fake_rerun_module(calls, paths, new_api=False))
+
+    from abstract_harness.robot.core.logging.rerun_sink import RerunSink
+
+    # jpeg_quality=None: this fake's Image has no compress; silence the fallback warning.
+    sink = RerunSink(str(tmp_path / "run.rrd"), jpeg_quality=None)
+    assert sink.available is True  # imports the fake backend
+    assert sink.available is True  # cached self._rr path
+
+    (log,) = eval(
+        _task(max_steps=40),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+        sinks=[sink],
+    )
+    assert log.status == "success"
+    assert "init" in calls and "save" in calls and "time" in calls
+    # Entities are namespaced per trial so trials never overwrite each other.
+    assert paths and all(p.startswith("trial/s/e0/") for p in paths)
+
+    # Exercise the empty-observation and reward-is-None branches directly.
+    sink.log_step(
+        0,
+        Observation(),  # no images, no state
+        Action(data=np.zeros(2)),
+        StepResult(observation=Observation(), reward=None),
+    )
+    assert sink.flush(timeout=5.0)
+    sink.on_eval_end(None)  # type: ignore[arg-type]
+
+    # A sink with no recording path skips rr.save (the other on_eval_start branch).
+    RerunSink().on_eval_start(None)  # type: ignore[arg-type]
+
+
+def test_rerun_sink_supports_new_sdk_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    calls: list[str] = []
+    paths: list[str] = []
+    monkeypatch.setitem(sys.modules, "rerun", _fake_rerun_module(calls, paths, new_api=True))
+
+    from abstract_harness.robot.core.logging.rerun_sink import RerunSink
+
+    sink = RerunSink(jpeg_quality=None)
+    (log,) = eval(
+        _task(max_steps=40),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        sinks=[sink],
+        store_actions=False,
+    )
+    assert log.status == "success"
+    assert "time" in calls  # rr.set_time (>=0.23) was used
+    assert paths and all(p.startswith("trial/s/e0/") for p in paths)

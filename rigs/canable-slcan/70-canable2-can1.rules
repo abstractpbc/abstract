@@ -1,0 +1,7 @@
+# Example udev rule for a YAM arm on a CANable2 adapter with slcan firmware (USB
+# 16d0:117e). Replace 0123456789AB with your adapter's USB serial: `udevadm info -a -n
+# /dev/ttyACM0 | grep -m1 'ATTRS{serial}'`, or the serial in its /dev/serial/by-id/ name.
+# The adapter enumerates as a CDC-ACM modem with AT protocol, so ModemManager would probe
+# it on plug and race slcand; ignore it there. Start can1-slcan.service whenever it
+# appears. Install steps: docs/ROBOT.md, "A CANable2 arm as a systemd unit".
+ACTION!="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="16d0", ATTRS{idProduct}=="117e", ATTRS{serial}=="0123456789AB", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="can1-slcan.service"

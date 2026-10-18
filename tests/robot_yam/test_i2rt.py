@@ -1,0 +1,631 @@
+"""Tests for lazy I2RT loading and declared conformance (runtime requirements, device slots)."""
+
+from __future__ import annotations
+
+import builtins
+import logging
+import sys
+import threading
+import time
+from types import ModuleType
+
+import pytest
+
+import abstract_harness.robot.yam._i2rt as i2rt_module
+from abstract_harness.robot.yam._i2rt import (
+    I2RT_INSTALL_COMMAND,
+    _load_i2rt,
+    _load_i2rt_kinematics,
+    close_robot_safely,
+    start_arms_concurrently,
+)
+from abstract_harness.robot.yam.config import YamConfig
+from abstract_harness.robot.yam.embodiment import YAMEmbodiment
+from abstract_harness.robot.yam.policy import MolmoAct2Policy
+
+
+class FakeMotorInterface:
+    def __init__(self, events: list[str]) -> None:
+        self.closed = False
+        self.events = events
+        self.send_after_close: list[ValueError] = []
+
+    def send(self) -> None:
+        if self.closed:
+            error = ValueError("file descriptor cannot be a negative integer (-1)")
+            self.send_after_close.append(error)
+            raise error
+
+    def close(self) -> None:
+        self.events.append("iface_close")
+        self.closed = True
+
+
+class FakeChain:
+    def __init__(self, *, bound_target: bool = True, ignores_running: bool = False) -> None:
+        self.running = True
+        self.events: list[str] = []
+        self.errors: list[ValueError] = []
+        self.motor_interface = FakeMotorInterface(self.events)
+        self._started = threading.Event()
+        self._release = threading.Event()
+        self._ignores_running = ignores_running
+
+        if bound_target:
+            target = self._control_loop
+        else:
+
+            def target() -> None:
+                self._control_loop()
+
+        self.control_thread = threading.Thread(
+            target=target,
+            name="fake-i2rt-control",
+            daemon=ignores_running,
+        )
+        self.control_thread.start()
+        assert self._started.wait(timeout=1.0)
+
+    def _control_loop(self) -> None:
+        self._started.set()
+        try:
+            while self.running or (self._ignores_running and not self._release.is_set()):
+                try:
+                    self.motor_interface.send()
+                except ValueError as exc:
+                    self.errors.append(exc)
+                    if not self._ignores_running:
+                        break
+                time.sleep(0.001)
+        finally:
+            self.events.append("loop_exit")
+
+    def release(self) -> None:
+        self._release.set()
+
+    def stop(self) -> None:
+        self.running = False
+        self.release()
+        self.control_thread.join(timeout=0.2)
+
+
+class FakeRobot:
+    def __init__(self, chain: FakeChain) -> None:
+        self.motor_chain = chain
+
+    def close(self) -> None:
+        self.motor_chain.running = False
+        self.motor_chain.motor_interface.close()
+
+
+def test_load_i2rt_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_get_robot = object()
+    fake_gripper_type = object()
+    modules = {
+        "i2rt": ModuleType("i2rt"),
+        "i2rt.robots": ModuleType("i2rt.robots"),
+        "i2rt.robots.get_robot": ModuleType("i2rt.robots.get_robot"),
+        "i2rt.robots.utils": ModuleType("i2rt.robots.utils"),
+    }
+    modules["i2rt"].__path__ = []
+    modules["i2rt.robots"].__path__ = []
+    modules["i2rt.robots.get_robot"].get_yam_robot = fake_get_robot
+    modules["i2rt.robots.utils"].GripperType = fake_gripper_type
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    assert _load_i2rt() == (fake_get_robot, fake_gripper_type)
+
+
+def test_load_i2rt_kinematics_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    symbols = [object() for _ in range(5)]
+    modules = {
+        "i2rt": ModuleType("i2rt"),
+        "i2rt.robots": ModuleType("i2rt.robots"),
+        "i2rt.robots.kinematics": ModuleType("i2rt.robots.kinematics"),
+        "i2rt.robots.utils": ModuleType("i2rt.robots.utils"),
+        "mink": ModuleType("mink"),
+    }
+    modules["i2rt"].__path__ = []
+    modules["i2rt.robots"].__path__ = []
+    modules["i2rt.robots.kinematics"].Kinematics = symbols[0]
+    modules["i2rt.robots.utils"].ArmType = symbols[1]
+    modules["i2rt.robots.utils"].GripperType = symbols[2]
+    modules["i2rt.robots.utils"].combine_arm_and_gripper_xml = symbols[3]
+    modules["mink"].NoSolutionFound = symbols[4]
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    assert _load_i2rt_kinematics() == tuple(symbols)
+
+
+@pytest.mark.parametrize("missing_name", ["i2rt", "i2rt.robots"])
+def test_load_i2rt_kinematics_guides_missing_driver(
+    monkeypatch: pytest.MonkeyPatch, missing_name: str
+) -> None:
+    real_import = builtins.__import__
+
+    def missing_i2rt(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("i2rt"):
+            raise ModuleNotFoundError(f"No module named {missing_name!r}", name=missing_name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", missing_i2rt)
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        _load_i2rt_kinematics()
+    assert I2RT_INSTALL_COMMAND in str(exc_info.value)
+
+
+@pytest.mark.parametrize("missing_name", [None, "mink"])
+def test_load_i2rt_kinematics_preserves_non_i2rt_import_failures(
+    monkeypatch: pytest.MonkeyPatch, missing_name: str | None
+) -> None:
+    real_import = builtins.__import__
+    original = ModuleNotFoundError("optional solver dependency is broken", name=missing_name)
+
+    def broken_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("i2rt"):
+            modules = sys.modules
+            if "i2rt" not in modules:
+                modules["i2rt"] = ModuleType("i2rt")
+                modules["i2rt"].__path__ = []
+                modules["i2rt.robots"] = ModuleType("i2rt.robots")
+                modules["i2rt.robots"].__path__ = []
+            raise original
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        _load_i2rt_kinematics()
+    assert exc_info.value is original
+
+
+@pytest.mark.parametrize("missing_name", ["i2rt", "i2rt.robots"])
+def test_load_i2rt_guides_missing_driver(
+    monkeypatch: pytest.MonkeyPatch, missing_name: str
+) -> None:
+    real_import = builtins.__import__
+
+    def missing_i2rt(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("i2rt"):
+            raise ModuleNotFoundError(f"No module named {missing_name!r}", name=missing_name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", missing_i2rt)
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        _load_i2rt()
+    assert I2RT_INSTALL_COMMAND in str(exc_info.value)
+
+
+def test_load_i2rt_preserves_nameless_missing_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_import = builtins.__import__
+    original = ModuleNotFoundError("import machinery gave no module name", name=None)
+
+    def nameless_failure(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("i2rt"):
+            raise original
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", nameless_failure)
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        _load_i2rt()
+    assert exc_info.value is original
+
+
+def test_load_i2rt_preserves_other_missing_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_import = builtins.__import__
+    original = ModuleNotFoundError("No module named 'broken_driver_dep'", name="broken_driver_dep")
+
+    def broken_i2rt(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("i2rt"):
+            raise original
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", broken_i2rt)
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        _load_i2rt()
+    assert exc_info.value is original
+
+
+@pytest.mark.parametrize("component", [YAMEmbodiment, MolmoAct2Policy])
+def test_runtime_requirements_use_top_level_modules_and_nonempty_commands(component: type) -> None:
+    requirements = component.RUNTIME_REQUIREMENTS
+
+    assert requirements
+    assert all(isinstance(module, str) and "." not in module for module in requirements)
+    assert all(isinstance(command, str) and command for command in requirements.values())
+
+
+def test_yam_i2rt_runtime_requirement_uses_install_command() -> None:
+    assert YAMEmbodiment.RUNTIME_REQUIREMENTS["i2rt"] == I2RT_INSTALL_COMMAND
+
+
+def test_i2rt_install_command_carries_ruckig_build_constraint() -> None:
+    """The remedy must pre-pin scikit-build-core, or ruckig's sdist fails to build (#47)."""
+    assert "scikit-build-core<0.10" in I2RT_INSTALL_COMMAND
+    assert "--build-constraints" in I2RT_INSTALL_COMMAND
+    assert '"i2rt @ git+https://github.com/i2rt-robotics/i2rt@' in I2RT_INSTALL_COMMAND
+
+
+def test_close_robot_safely_joins_control_thread_before_socket_close() -> None:
+    chain = FakeChain()
+    robot = FakeRobot(chain)
+
+    try:
+        close_robot_safely(robot)
+
+        assert not chain.control_thread.is_alive()
+        assert chain.motor_interface.closed
+        assert not chain.motor_interface.send_after_close
+        assert not chain.errors
+
+        robot.close()
+        assert chain.events.count("iface_close") == 1
+    finally:
+        chain.stop()
+
+
+def test_close_robot_safely_orders_loop_exit_before_interface_close() -> None:
+    chain = FakeChain()
+
+    try:
+        close_robot_safely(FakeRobot(chain))
+
+        assert chain.events.index("loop_exit") < chain.events.index("iface_close")
+    finally:
+        chain.stop()
+
+
+def test_close_robot_safely_without_motor_chain_calls_robot_close() -> None:
+    class RobotWithoutChain:
+        motor_chain = None
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    robot = RobotWithoutChain()
+
+    close_robot_safely(robot)
+
+    assert robot.closed
+
+
+def test_close_robot_safely_uses_grace_period_without_discoverable_thread() -> None:
+    chain = FakeChain(bound_target=False)
+
+    try:
+        close_robot_safely(FakeRobot(chain))
+        chain.control_thread.join(timeout=0.2)
+
+        assert chain.motor_interface.closed
+        assert not chain.control_thread.is_alive()
+        assert not chain.motor_interface.send_after_close
+    finally:
+        chain.stop()
+
+
+def test_close_robot_safely_warns_and_closes_interface_after_join_timeout(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    chain = FakeChain(ignores_running=True)
+    monkeypatch.setattr(i2rt_module, "_CONTROL_THREAD_JOIN_TIMEOUT", 0.01)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger=i2rt_module.__name__):
+            close_robot_safely(FakeRobot(chain))
+
+        assert chain.motor_interface.closed
+        assert "fake-i2rt-control" in caplog.text
+    finally:
+        chain.stop()
+
+
+def test_device_slots_cover_channels_and_cameras_with_valid_config_args() -> None:
+    """Every declared slot writes a real YamConfig field, grouped per hardware constraint."""
+    from dataclasses import fields
+
+    from abstract_harness.robot.core.conformance import DEVICE_KINDS, DeviceSlot, device_slots
+
+    slots = device_slots(YAMEmbodiment)
+
+    assert slots == YAMEmbodiment.DEVICE_SLOTS  # defensive reader keeps every entry
+    config_fields = {f.name for f in fields(YamConfig)}
+    assert all(isinstance(slot, DeviceSlot) for slot in slots)
+    assert all(slot.arg in config_fields for slot in slots)
+    assert all(slot.kind in DEVICE_KINDS for slot in slots)
+    assert {slot.arg for slot in slots if slot.group == "arms"} == {
+        "left_channel",
+        "right_channel",
+    }
+    assert {slot.arg for slot in slots if slot.group == "cameras"} == {
+        "top_cam_device",
+        "left_cam_device",
+        "right_cam_device",
+    }
+
+
+def test_option_slots_declare_boolean_config_args() -> None:
+    """Every declared option toggles a real YamConfig bool."""
+    from dataclasses import fields
+
+    from abstract_harness.robot.core.conformance import OptionSlot, option_slots
+
+    options = option_slots(YAMEmbodiment)
+
+    assert options == YAMEmbodiment.OPTION_SLOTS  # defensive reader keeps every entry
+    config_fields = {f.name for f in fields(YamConfig)}
+    assert all(isinstance(option, OptionSlot) for option in options)
+    assert all(option.arg in config_fields for option in options)
+    assert {option.arg for option in options} == {
+        "auto_start",
+        "collision_guardrail",
+        "eef_orientation",
+        "report_joint_eff",
+    }
+
+
+def test_number_slots_declare_numeric_config_args() -> None:
+    """Every declared number writes a real YamConfig field with a pinned contract."""
+    from dataclasses import fields
+
+    from abstract_harness.robot.core.conformance import NumberSlot, number_slots
+
+    numbers = number_slots(YAMEmbodiment)
+
+    assert numbers == YAMEmbodiment.NUMBER_SLOTS  # defensive reader keeps every entry
+    config_fields = {f.name for f in fields(YamConfig)}
+    assert all(isinstance(number, NumberSlot) for number in numbers)
+    assert all(number.arg in config_fields for number in numbers)
+    assert {number.arg for number in numbers} == {"motor_temp_limit"}
+    assert numbers == (
+        NumberSlot(
+            arg="motor_temp_limit",
+            label="Motor temperature soft limit in degrees C "
+            "(motor_temp_limit; none disables the thermal guardrail)",
+            default=70,
+            minimum=1,
+            maximum=None,
+            allow_none=True,
+        ),
+    )
+
+
+def test_motor_temp_limit_wizard_default_diverges_from_config_default() -> None:
+    """The wizard suggests 70 while the config default keeps the guardrail off.
+
+    Fresh wizard-driven setups should arm the thermal guardrail, while direct
+    library users retain the non-breaking disabled default. Operators can still
+    answer none in the wizard to choose the disabled behavior explicitly.
+    """
+    motor_temp_slot = next(
+        number for number in YAMEmbodiment.NUMBER_SLOTS if number.arg == "motor_temp_limit"
+    )
+
+    assert motor_temp_slot.default == 70
+    assert YamConfig().motor_temp_limit is None
+
+
+def test_auto_start_wizard_default_diverges_from_config_default() -> None:
+    """The wizard suggests yes while the config default stays off.
+
+    Deliberate divergence: runs configured outside setup keep the
+    conservative prompt-gated flow, but the interactive wizard nudges
+    operators toward zero-touch starts. The wizard always writes an
+    explicit true/false, so the suggestion never leaks into configs it
+    did not write.
+    """
+    auto_start_slot = next(
+        option for option in YAMEmbodiment.OPTION_SLOTS if option.arg == "auto_start"
+    )
+
+    assert auto_start_slot.default is True
+    assert YamConfig().auto_start is False
+
+
+def test_report_joint_eff_wizard_default_matches_config_default() -> None:
+    """Fresh wizard and direct configs both keep effort reporting opt-in."""
+    report_slot = next(
+        option for option in YAMEmbodiment.OPTION_SLOTS if option.arg == "report_joint_eff"
+    )
+
+    assert report_slot.default is False
+    assert YamConfig().report_joint_eff is False
+
+
+def test_eef_orientation_slot_matches_config_default_and_contract() -> None:
+    """Fresh wizard and direct configs both keep EEF tilt axes opt-in."""
+    orientation_slot = next(
+        option for option in YAMEmbodiment.OPTION_SLOTS if option.arg == "eef_orientation"
+    )
+
+    assert orientation_slot.label == (
+        "Open EEF pitch/roll tilt axes (eef_orientation; eef_pos rigs only, "
+        "raise the eef_low z floor after)"
+    )
+    assert orientation_slot.default is False
+    assert YamConfig().eef_orientation is False
+
+
+def test_collision_guardrail_wizard_default_diverges_from_config_default() -> None:
+    """The wizard suggests no while the config default stays on.
+
+    Deliberate divergence, the mirror of auto_start: configs written
+    outside setup keep the protective runtime default, but a fresh
+    interactive setup has no measured collision_*_base_pos geometry, and
+    the library-default offsets can false-positive hold until max_steps
+    (#109). The wizard therefore suggests off until the operator measures
+    the rig; an existing config's stored value stays the suggestion on
+    re-runs, so measured rigs that opted in are not nudged back out.
+    """
+    collision_slot = next(
+        option for option in YAMEmbodiment.OPTION_SLOTS if option.arg == "collision_guardrail"
+    )
+
+    assert collision_slot.label == (
+        "Block predicted arm collisions before they happen "
+        "(collision_guardrail; measure collision_*_base_pos first)"
+    )
+    assert collision_slot.default is False
+    assert YamConfig().collision_guardrail is True
+
+
+class CloseRecordingRobot:
+    def __init__(self, close_error: Exception | None = None) -> None:
+        self.close_calls = 0
+        self.close_error = close_error
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def test_start_arms_concurrently_returns_left_right_in_order() -> None:
+    left_sentinel = object()
+    right_sentinel = object()
+
+    assert start_arms_concurrently(
+        lambda: left_sentinel,
+        lambda: right_sentinel,
+    ) == (left_sentinel, right_sentinel)
+
+
+def test_start_arms_concurrently_actually_overlaps() -> None:
+    barrier = threading.Barrier(2, timeout=5)
+    left_sentinel = object()
+    right_sentinel = object()
+
+    def left_factory() -> object:
+        barrier.wait()
+        return left_sentinel
+
+    def right_factory() -> object:
+        barrier.wait()
+        return right_sentinel
+
+    assert start_arms_concurrently(left_factory, right_factory) == (
+        left_sentinel,
+        right_sentinel,
+    )
+
+
+def test_left_failure_closes_right_and_reraises() -> None:
+    right = CloseRecordingRobot()
+
+    def left_factory() -> object:
+        raise RuntimeError("left CAN down")
+
+    with pytest.raises(RuntimeError, match="left CAN down"):
+        start_arms_concurrently(left_factory, lambda: right)
+
+    assert right.close_calls == 1
+
+
+def test_right_failure_closes_left_and_reraises() -> None:
+    left = CloseRecordingRobot()
+
+    def right_factory() -> object:
+        raise RuntimeError("right CAN down")
+
+    with pytest.raises(RuntimeError, match="right CAN down"):
+        start_arms_concurrently(lambda: left, right_factory)
+
+    assert left.close_calls == 1
+
+
+def test_both_failures_raise_left_and_log_right(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    left_robots: list[CloseRecordingRobot] = []
+    right_robots: list[CloseRecordingRobot] = []
+
+    def left_factory() -> CloseRecordingRobot:
+        left_robots.append(CloseRecordingRobot())
+        raise RuntimeError("left init failed")
+
+    def right_factory() -> CloseRecordingRobot:
+        right_robots.append(CloseRecordingRobot())
+        raise ValueError("right init failed")
+
+    with (
+        caplog.at_level(logging.ERROR, logger=i2rt_module.__name__),
+        pytest.raises(RuntimeError, match="left init failed"),
+    ):
+        start_arms_concurrently(left_factory, right_factory)
+
+    assert "right init failed" in caplog.text
+    assert len(left_robots) == 1
+    assert len(right_robots) == 1
+    assert left_robots[0].close_calls == 0
+    assert right_robots[0].close_calls == 0
+
+
+def test_survivor_close_failure_does_not_mask_init_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    right = CloseRecordingRobot(ValueError("close boom"))
+
+    def left_factory() -> object:
+        raise RuntimeError("init boom")
+
+    with (
+        caplog.at_level(logging.WARNING, logger=i2rt_module.__name__),
+        pytest.raises(RuntimeError, match="init boom"),
+    ):
+        start_arms_concurrently(left_factory, lambda: right)
+
+    assert right.close_calls == 1
+    assert "close boom" in caplog.text
+
+
+def test_worker_base_exception_closes_built_arm_and_propagates() -> None:
+    right = CloseRecordingRobot()
+
+    def left_factory() -> object:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        start_arms_concurrently(left_factory, lambda: right)
+
+    assert right.close_calls == 1
+
+
+def test_interrupt_after_one_failure_logs_the_collected_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def left_factory() -> object:
+        raise RuntimeError("left init failed")
+
+    def right_factory() -> object:
+        raise KeyboardInterrupt
+
+    with (
+        caplog.at_level(logging.ERROR, logger=i2rt_module.__name__),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        start_arms_concurrently(left_factory, right_factory)
+
+    assert "left init failed" in caplog.text
+
+
+def test_bring_up_logs_side_markers(caplog: pytest.LogCaptureFixture) -> None:
+    left_sentinel = object()
+    right_sentinel = object()
+
+    with caplog.at_level(logging.INFO, logger=i2rt_module.__name__):
+        result = start_arms_concurrently(
+            lambda: left_sentinel,
+            lambda: right_sentinel,
+        )
+
+    assert result == (left_sentinel, right_sentinel)
+    assert "left arm bring-up starting" in caplog.text
+    assert "left arm bring-up complete" in caplog.text
+    assert "right arm bring-up starting" in caplog.text
+    assert "right arm bring-up complete" in caplog.text

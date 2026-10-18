@@ -1,0 +1,48 @@
+# Run any model on the Abstract Robotics Gateway (`https://api.abstract.inc/v1`)
+# on a physical two-YAM rig:
+#
+#   export ABSTRACT_API_KEY="sk-..."
+#   uv run abstract robot check --config rigs/yam-abstract.toml
+#   uv run abstract robot run --config rigs/yam-abstract.toml "fold the towel"
+
+[policy]
+server_url = "https://api.abstract.inc/v1"
+
+[policy.args]
+# Swap any model ID served by Abstract:
+# - "abstract/dreamzero-astra:yam"      (stateful 14B World-Action Model, 24x14 at 30 Hz)
+# - "physical-intelligence/pi0.5:yam"   (stateless pi0.5 VLA, 30x14 at 30 Hz)
+# - "allenai/molmoact2:yam"             (stateless MolmoAct2 VLA, 30x14 at 30 Hz)
+# - "perceptron/isaac-0.5:yam"          (stateless Isaac 0.5 VLA, 30x14 at 30 Hz)
+model = "abstract/dreamzero-astra:yam"
+cam_width = 640
+cam_height = 360
+
+[rig]
+name = "yam-1"
+max_steps = 3600
+
+[rig.embodiment]
+left_channel = "can1"
+right_channel = "can0"
+gripper_type = "LINEAR_4310"
+control_interface = "joints"
+control_hz = 30
+zero_gravity_mode = false
+rest_secs = 6.0
+motor_temp_limit = 70
+joint_low = [-2.618, 0.0, 0.0, -1.693, -1.5708, -2.0944, 0.0, -2.618, 0.0, 0.0, -1.693, -1.5708, -2.0944, 0.0]
+joint_high = [3.1416, 3.6652, 3.1416, 1.5708, 1.5708, 2.0944, 1.0, 3.1416, 3.6652, 3.1416, 1.5708, 1.5708, 2.0944, 1.0]
+collision_guardrail = false
+top_depth_serial = "000000000001"
+left_depth_serial = "000000000002"
+right_depth_serial = "000000000003"
+realsense_capture = "process"
+depth_fps = 15
+capture_width = 640
+capture_height = 360
+cam_width = 640
+cam_height = 360
+
+[data]
+formats = ["rrd", "lerobot"]

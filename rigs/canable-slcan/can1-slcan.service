@@ -1,0 +1,25 @@
+# Example unit: brings up can1 (one YAM arm) on a CANable2 with slcan firmware at
+# 1 Mbit/s, replacing the manual `slcand -o -c -s8 /dev/ttyACM0 can1 && ip link set can1 up`.
+# 70-canable2-can1.rules starts it when the adapter appears; BindsTo stops it when the
+# adapter goes. Install steps: docs/ROBOT.md, "A CANable2 arm as a systemd unit".
+#
+# Replace the device below with your adapter's: its /dev/serial/by-id/ name (ls
+# /dev/serial/by-id/) carries the firmware build and the USB serial, so it differs per
+# adapter. BindsTo and After take the same path as a systemd device unit:
+# `systemd-escape --path --suffix=device /dev/serial/by-id/<name>` prints it.
+
+[Unit]
+Description=can1 on a CANable2 (slcan, 1 Mbit/s) for a YAM arm
+BindsTo=dev-serial-by\x2did-usb\x2dOpenlight_Labs_CANable2_b158aa7_github.com_normaldotcom_canable2\x2dfw.git_0123456789AB\x2dif00.device
+After=dev-serial-by\x2did-usb\x2dOpenlight_Labs_CANable2_b158aa7_github.com_normaldotcom_canable2\x2dfw.git_0123456789AB\x2dif00.device
+
+[Service]
+Type=simple
+# -F stays in the foreground so systemd tracks slcand; -o opens the channel, -c closes it
+# on exit, -s8 is 1 Mbit/s. The by-id path survives ttyACM renumbering.
+ExecStart=/usr/bin/slcand -F -o -c -s8 /dev/serial/by-id/usb-Openlight_Labs_CANable2_b158aa7_github.com_normaldotcom_canable2-fw.git_0123456789AB-if00 can1
+# slcand creates can1 shortly after it starts; wait up to 5 s for it.
+ExecStartPost=/usr/bin/timeout 5 /bin/sh -c 'until [ -e /sys/class/net/can1 ]; do sleep 0.1; done'
+ExecStartPost=/usr/sbin/ip link set can1 up
+Restart=on-failure
+RestartSec=2

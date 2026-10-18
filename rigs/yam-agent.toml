@@ -1,0 +1,110 @@
+# An OpenAI model drives a two-arm YAM rig (two I2RT YAM arms with LINEAR_4310 grippers,
+# a RealSense D435i overhead, a D405 on each wrist) through the agent policy's tool loop,
+# behind the harness's spend meter. Everything for this setup is in this file:
+#
+#   uv run abstract robot check --config rigs/yam-agent.toml
+#   uv run abstract robot run --config rigs/yam-agent.toml --allow-paid "put the cup in the box"
+#
+# Every run is paid, moves real arms, and needs --allow-paid and an operator at the rig.
+# The API key stays out of this file: OPENAI_API_KEY in ~/.config/abstract/openai.env
+# (chmod 600). For your rig or a variant (another model, a smaller budget), copy this file
+# to *.local.toml (gitignored) and edit the copy: at least the camera serials below.
+
+[agent]
+model = "gpt-6.1-sol"
+upstream = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+effort = "low"
+max_output_tokens = 4096
+max_calls = 40
+# At most 5.00: the harness refuses a larger budget for one run.
+budget_usd = 2.00
+request_timeout_s = 110.0
+# OpenAI bills a request above this many input tokens at long-context rates. The meter
+# refuses (HTTP 402) any request whose conservative input estimate exceeds it.
+long_context_threshold = 272000
+
+[agent.pricing]
+# Current USD per million tokens, from the provider's price list. Never guessed: update
+# them when the model or its prices change. Uncached input is billed at the higher of
+# input and cache-write rates.
+input_per_million = 2.00
+cached_input_per_million = 0.10
+output_per_million = 10.00
+cache_write_per_million = 2.50
+
+[agent.long_context_pricing]
+# The model's rates above long_context_threshold, used only if a call is reported above
+# it despite the refusal; without them such a call blocks every further call.
+input_per_million = 4.00
+cached_input_per_million = 0.20
+output_per_million = 15.00
+cache_write_per_million = 5.00
+
+[agent.args]
+# Agent policy arguments; model, wire, base_url, api_key_env, effort and max_llm_calls
+# come from [agent]. Playout at 5% of each axis range per second (default 10%).
+max_speed_frac = 0.05
+images = "always"
+image_horizon = 2
+# Colour frames only; depth renders would double the images sent on every turn.
+depth = "off"
+
+[rig]
+# The robot's name in the runs store (the API's robot; the bucket's key prefix).
+name = "yam-1"
+# Where runs are written; default $XDG_DATA_HOME/abstract/robot/runs, else
+# ~/.local/share/abstract/robot/runs. Relative paths resolve against this file.
+# log_root = "/var/lib/abstract/robot/runs"
+max_steps = 2400
+
+[rig.embodiment]
+# yam_arms arguments. Both CAN channels are required: which interface drives which arm
+# depends on how the rig is wired. Here the right arm is on can0 (a gs_usb adapter) and
+# the left on can1 (a CANable2 through slcand, rigs/canable-slcan/), the reverse of
+# yam_arms' defaults. Check yours with holdcheck, one arm at a time, before a run.
+left_channel = "can1"
+right_channel = "can0"
+gripper_type = "LINEAR_4310"
+control_hz = 10
+# Cartesian control: the agent's move_to takes metres in each arm's base frame, with
+# yam_arms' default workspace bounds. EEF mode has no collision guardrail.
+control_interface = "eef_pos"
+# Hold pose stiffly while the model thinks (the default is compliant).
+zero_gravity_mode = false
+settle_tolerance = 0.05
+# Slower homing and parking ramps for bring-up (default 3 s).
+rest_secs = 6.0
+motor_temp_limit = 70
+# Off until the arm bases and table height are measured; inactive in eef_pos anyway.
+collision_guardrail = false
+# librealsense serials of your cameras (placeholders here; the USB descriptor serials
+# differ). `rs-enumerate-devices -s` lists them, and so does `abstract robot check` when
+# one is missing. Confirm the wrist sides by covering one wrist camera and checking which
+# frame goes dark.
+top_depth_serial = "000000000001"
+left_depth_serial = "000000000002"
+right_depth_serial = "000000000003"
+realsense_capture = "process"
+# 15 fps keeps three RealSense streams within the bandwidth of a USB 2 link (default 30).
+depth_fps = 15
+cam_width = 640
+cam_height = 480
+# Appended to the agent's embodiment notes. Describe only what the camera frames show on
+# your rig; these notes fit the usual YAM setup with a D405 on each wrist.
+docs_extra = "Rig notes: left_cam and right_cam are wrist cameras looking forward along each gripper; the open fingers show at the bottom of their images. With pitch and roll pinned the gripper keeps its start orientation, pointing forward (+x) with the jaws opening left-right, so grasp objects from the side by approaching along +x. top_cam is fixed and looks forward across the table."
+
+# Where finished runs go. Without [store], runs stay in log_root. With it, each finished
+# run is uploaded and then deleted locally (one line per run stays in
+# <log_root>/runs.jsonl). See docs/ROBOT.md, "Where runs go".
+#
+# The Abstract runs API, under the account of ABSTRACT_API_KEY or of `abstract login`'s key:
+# [store]
+# route = "abstract"
+#
+# Or an R2 bucket you own, written over its S3 API, with R2_ACCOUNT_ID,
+# R2_RUNS_ACCESS_KEY_ID and R2_RUNS_SECRET_ACCESS_KEY in env_file (chmod 600):
+# [store]
+# route = "bucket"
+# bucket = "my-robot-runs"
+# env_file = "~/.config/abstract/r2.env"

@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rig control</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #deded8;
+  --accent: #2456c7; --danger: #c0352b; --ok: #2f7d32; --term-bg: #16171a; --term-text: #d6d6d0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111214; --panel: #1a1b1e; --text: #e7e7e2; --muted: #9a9a94; --line: #2c2d31;
+    --accent: #7aa2ff; --danger: #ff6b5e; --ok: #6cc070; --term-bg: #0b0c0e; --term-text: #d6d6d0;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0; }
+.pill { padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.pill.running { color: var(--ok); border-color: var(--ok); }
+.pill.finishing, .pill.checking, .pill.uploading { color: var(--accent); border-color: var(--accent); }
+.pill.gates-off { color: var(--danger); border-color: var(--danger); }
+.busy { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(300px, 2fr); gap: 12px; padding: 12px 16px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.cams { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+figure { margin: 0; }
+figure img { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #000; border-radius: 4px; display: block; }
+figcaption { color: var(--muted); font-size: 12px; padding-top: 2px; }
+textarea, input, select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; width: 100%; }
+textarea { min-height: 64px; resize: vertical; }
+.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.row > * { flex: 1 1 auto; width: auto; }
+button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--text); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+button:disabled { opacity: .45; cursor: default; }
+.dialog { border: 1px solid var(--accent); border-radius: 6px; padding: 8px; margin-top: 8px; }
+.dialog p { margin: 0 0 6px; font-weight: 600; }
+pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.term { background: var(--term-bg); color: var(--term-text); border-radius: 6px; padding: 8px;
+  height: 320px; overflow: auto; font: 12px/1.35 ui-monospace, Menlo, monospace; }
+.transcript { max-height: 320px; overflow: auto; font-size: 13px; }
+.transcript div { border-bottom: 1px solid var(--line); padding: 4px 0; }
+.transcript b { color: var(--muted); font-weight: 600; margin-right: 6px; }
+.status { color: var(--muted); font: 12px ui-monospace, Menlo, monospace; margin-top: 8px; min-height: 1.3em; }
+.err { color: var(--danger); min-height: 1.4em; margin-top: 6px; }
+.stack { display: grid; gap: 12px; align-content: start; }
+#token-box { display: none; gap: 8px; align-items: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rig control</h1>
+  <span id="phase" class="pill">connecting</span>
+  <span id="policy" class="pill"></span>
+  <span id="verdicts" class="pill" hidden title="serve --no-verdict: runs end without the verdict and notes prompts">verdicts off</span>
+  <span id="gates" class="pill gates-off" hidden title="serve --auto-start: runs skip the home and scene-ready gates; keep someone at the rig with the e-stop">gates off</span>
+  <span id="held" class="pill" hidden>new runs paused</span>
+  <span id="run" class="pill" hidden></span>
+  <span id="step" class="pill" hidden></span>
+  <span id="uploading" class="pill uploading" hidden></span>
+  <span id="token-box"><input id="token" type="password" placeholder="RPC token" size="28"><button id="save-token">Connect</button></span>
+</header>
+<main>
+  <div class="stack">
+    <section>
+      <h2>Cameras</h2>
+      <div id="cams" class="cams"></div>
+    </section>
+    <section>
+      <h2>Terminal</h2>
+      <pre id="term" class="term"></pre>
+    </section>
+  </div>
+  <div class="stack">
+    <section>
+      <h2>Run</h2>
+      <textarea id="instruction" placeholder="Instruction, e.g. fold the cloth"></textarea>
+      <div class="row">
+        <input id="tags" placeholder="Tags (optional), e.g. cloth demo">
+      </div>
+      <div class="row">
+        <button id="start" class="primary">Start run</button>
+        <button id="check">Check rig</button>
+        <button id="hold" title="Refuse new prompts while the scene is reset; a running episode goes on">Pause new runs</button>
+      </div>
+      <p id="busy" class="busy" hidden></p>
+      <pre id="status" class="status"></pre>
+      <div id="dialogs"></div>
+      <div class="row">
+        <input id="steer" placeholder="Message to the policy">
+        <button id="send">Send</button>
+      </div>
+      <div class="row">
+        <select id="verdict">
+          <option value="">End episode, verdict later</option>
+          <option value="y">End: success</option>
+          <option value="n">End: failure</option>
+          <option value="partial">End: partial</option>
+        </select>
+        <button id="stop">End episode</button>
+        <button id="abort" class="danger" title="Ctrl-C: stop now and park the arms">Abort</button>
+      </div>
+      <div id="error" class="err"></div>
+    </section>
+    <section>
+      <h2>Policy transcript</h2>
+      <div id="transcript" class="transcript"></div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let token = "";
+try { token = new URLSearchParams(location.hash.slice(1)).get("token") || localStorage.getItem("rpc-token") || ""; } catch {}
+let source = null, nextId = 1, state = null, shownCameras = null;
+
+async function rpc(type, fields = {}) {
+  const res = await fetch("/rpc", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({ id: "ui-" + nextId++, type, ...fields }),
+  });
+  if (res.status === 401) { askToken(); throw new Error("token rejected"); }
+  const body = await res.json();
+  if (!body.success) throw new Error(body.error || "failed");
+  return body.data;
+}
+
+function act(promise) { $("error").textContent = ""; promise.catch((e) => { $("error").textContent = e.message; }); }
+
+function askToken() { $("token-box").style.display = "flex"; }
+
+function term(line) {
+  const el = $("term");
+  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+  el.textContent += line + "\n";
+  if (el.textContent.length > 200000) el.textContent = el.textContent.slice(-150000);
+  if (stick) el.scrollTop = el.scrollHeight;
+}
+
+function transcript(message) {
+  const div = document.createElement("div");
+  const role = document.createElement("b");
+  role.textContent = message.role || "message";
+  const content = Array.isArray(message.content)
+    ? message.content.map((part) => part.text || part.arguments || part.output || "").join(" ")
+    : typeof message.content === "string" ? message.content : JSON.stringify(message);
+  div.append(role, document.createTextNode(content));
+  $("transcript").append(div);
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+}
+
+function render() {
+  const busy = state.phase !== "idle";
+  $("phase").textContent = state.phase;
+  $("phase").className = "pill " + state.phase;
+  $("policy").textContent = state.policy || "";
+  $("verdicts").hidden = !state.noVerdict;
+  $("gates").hidden = !state.autoStart;
+  $("held").hidden = !state.held;
+  $("hold").textContent = state.held ? "Resume new runs" : "Pause new runs";
+  $("run").hidden = !state.run;
+  $("step").hidden = !(state.run && state.run.step != null);
+  if (state.run) {
+    $("run").textContent = state.run.id;
+    $("step").textContent = "step " + state.run.step;
+  }
+  $("status").textContent = state.status || "";
+  $("start").disabled = busy || state.held;
+  $("check").disabled = busy;
+  // A disabled Start run always says why.
+  const waits = {
+    running: "a run is in progress",
+    finishing: "the arms are parked; the run is writing its data and summary",
+    checking: "the rig check is running",
+  };
+  $("busy").hidden = !busy && !state.held;
+  $("busy").textContent = "Start run waits: "
+    + (busy ? waits[state.phase] || state.phase : "new runs are paused") + ".";
+  const uploads = state.uploads || { queued: [], current: null };
+  $("uploading").hidden = !uploads.current;
+  $("uploading").textContent = "uploading " + uploads.current
+    + (uploads.queued.length ? " (+" + uploads.queued.length + " queued)" : "");
+  for (const id of ["send", "stop", "abort"]) $(id).disabled = !busy || state.phase === "checking";
+  const box = $("dialogs");
+  box.replaceChildren();
+  for (const d of state.pendingDialogs) box.append(dialog(d));
+  if (state.cameras.join() !== shownCameras) cameras();
+}
+
+function dialog(d) {
+  const wrap = document.createElement("div");
+  wrap.className = "dialog";
+  const title = document.createElement("p");
+  title.textContent = d.title;
+  wrap.append(title);
+  const row = document.createElement("div");
+  row.className = "row";
+  const answer = (fields) => act(rpc("extension_ui_response", { id: d.id, ...fields }).then(refresh));
+  const button = (label, fields, cls) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (cls) b.className = cls;
+    b.onclick = () => answer(fields);
+    row.append(b);
+  };
+  if (d.method === "confirm") {
+    button("Confirm (Enter)", { confirmed: true }, "primary");
+    button("Cancel (Ctrl-C)", { cancelled: true }, "danger");
+  } else if (d.method === "select") {
+    for (const option of d.options) button(option, { value: option }, option === "y" ? "primary" : "");
+  } else {
+    const input = document.createElement("input");
+    input.placeholder = "Enter for none";
+    row.append(input);
+    const b = document.createElement("button");
+    b.textContent = "Submit";
+    b.onclick = () => answer({ value: input.value });
+    row.append(b);
+  }
+  wrap.append(row);
+  return wrap;
+}
+
+async function refresh() { state = await rpc("get_state"); render(); return state; }
+
+function cameras() {
+  const box = $("cams");
+  shownCameras = state.cameras.join();
+  box.replaceChildren();
+  for (const cam of state.cameras) {
+    const fig = document.createElement("figure");
+    const img = document.createElement("img");
+    img.alt = cam;
+    img.src = "/feed/" + encodeURIComponent(cam) + "?token=" + encodeURIComponent(token);
+    img.onerror = () => setTimeout(() => { img.src = img.src.split("&")[0] + "&r=" + Date.now(); }, 3000);
+    const cap = document.createElement("figcaption");
+    cap.textContent = cam;
+    fig.append(img, cap);
+    box.append(fig);
+  }
+}
+
+function listen(since) {
+  if (source) source.close();
+  source = new EventSource("/events?since=" + since + "&token=" + encodeURIComponent(token));
+  // On every (re)connect the state is read again, so nothing missed while the stream was
+  // down (a run's end, an upload) leaves the page stale.
+  source.onopen = () => { refresh().catch(() => {}); };
+  source.onmessage = (message) => {
+    const event = JSON.parse(message.data);
+    switch (event.type) {
+      case "output": term(event.text); break;
+      case "transcript": transcript(event.message); break;
+      case "check_result": term("check " + JSON.stringify(event.result)); break;
+      case "check_end": term("check: ready=" + event.ready); refresh(); break;
+      case "progress": refresh(); break;
+      case "run_start": $("transcript").replaceChildren(); refresh(); break;
+      case "run_end":
+        if (event.error) term("run failed: " + event.error);
+        if (event.runError) term("run: " + event.runError);
+        if (event.events === false) term("this run sent no events: answer its prompts at the rig");
+        if (event.tail && !event.summary) term("run ended before the episode (exit " + event.exitCode + ")");
+        refresh(); break;
+      case "status": $("status").textContent = event.text; break;
+      case "upload_start": term("upload " + event.run + ": started"); refresh(); break;
+      case "upload_end":
+        term(event.ok
+          ? "upload " + event.run + ": done" + (event.bytes != null ? ", " + (event.bytes / 1e6).toFixed(1) + " MB" : "")
+          : "upload " + event.run + " failed: " + (event.error || "unknown error")
+            + "; it stays on disk for abstract robot upload");
+        refresh(); break;
+      case "preview": break;
+      default: refresh();
+    }
+  };
+}
+
+async function connect() {
+  try {
+    await refresh();
+    $("token-box").style.display = "none";
+    try { localStorage.setItem("rpc-token", token); } catch {}
+    const out = await rpc("get_output", { lines: 400 });
+    $("term").textContent = "";
+    out.lines.forEach(term);
+    listen(state.eventSeq);
+  } catch (e) {
+    $("phase").textContent = "disconnected";
+    askToken();
+    $("error").textContent = e.message;
+  }
+}
+
+$("save-token").onclick = () => { token = $("token").value.trim(); connect(); };
+$("start").onclick = () => {
+  const tags = $("tags").value.split(/[\s,]+/).filter(Boolean);
+  act(rpc("prompt", { message: $("instruction").value, tags }).then(refresh));
+};
+$("check").onclick = () => act(rpc("check").then(refresh));
+$("hold").onclick = () => act(rpc("hold", { on: !(state && state.held) }).then(refresh));
+$("send").onclick = () => act(rpc("steer", { message: $("steer").value }).then(() => { $("steer").value = ""; }));
+$("steer").onkeydown = (e) => { if (e.key === "Enter") $("send").click(); };
+$("stop").onclick = () => act(rpc("stop", $("verdict").value ? { verdict: $("verdict").value } : {}));
+$("abort").onclick = () => act(rpc("abort"));
+connect();
+</script>
+</body>
+</html>

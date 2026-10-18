@@ -1,0 +1,9 @@
+abstract-harness
+Copyright 2026 Abstract PBC
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes software derived from github.com/robocurve/inspect-robots and
+github.com/robocurve/inspect-robots-yam (MIT License), and a YAM collision model
+generated from MuJoCo Menagerie's i2rt_yam model (MIT License, i2rt robotics).
+Their notices are in THIRD_PARTY_NOTICES.md.

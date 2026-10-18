@@ -1,0 +1,93 @@
+"""Guard the public API surface against accidental growth/shrinkage.
+
+If you intend to change the public API, update ``EXPECTED`` here and note it in
+the changelog. Everything not in ``abstract_harness.robot.core.__all__`` (or prefixed ``_``) is
+private and carries no stability guarantee.
+"""
+
+from __future__ import annotations
+
+import abstract_harness.robot.core
+
+EXPECTED = {
+    # evaluation + logs
+    "eval",
+    "eval_set",
+    "generate_scene",
+    "read_eval_log",
+    "EvalLog",
+    "EvalResults",
+    "EvalSpec",
+    "EvalStats",
+    "SceneResult",
+    "TrialRecord",
+    # tasks, scenes, scoring
+    "Task",
+    "TaskEnvelope",
+    "Epochs",
+    "Scene",
+    "Target",
+    "Scorer",
+    "Score",
+    "success_at_end",
+    "episode_length",
+    "min_distance_to_goal",
+    "reached_goal_state",
+    "operator_scorer",
+    "operator_input",
+    "is_affirmative_verdict",
+    # judgement capture (plans 0049 and 0069)
+    "Grader",
+    "operator_grader",
+    "vlm_grader",
+    # the two swappable inputs
+    "Policy",
+    "PolicyBase",
+    "PolicyInfo",
+    "PolicyConfig",
+    "Embodiment",
+    "EmbodimentBase",
+    "EmbodimentInfo",
+    # attended operator input
+    "OperatorInput",
+    "OperatorConsole",
+    "OperatorSession",
+    "ConsolePoll",
+    "EndRequest",
+    # types & spaces
+    "ABSOLUTE_CONTROL_MODES",
+    "Observation",
+    "Action",
+    "ActionChunk",
+    "OPERATOR_END",
+    "StepResult",
+    "Box",
+    "ActionSemantics",
+    "ObservationSpace",
+    "CameraSpec",
+    "StateField",
+    "StateSpec",
+    # registry decorators + resolution
+    "task",
+    "policy",
+    "embodiment",
+    "scorer",
+    "grader",
+    "sink",
+    "registered",
+    "resolve",
+    # public submodules
+    # meta
+    "__version__",
+}
+
+
+def test_public_api_snapshot() -> None:
+    assert set(abstract_harness.robot.core.__all__) == EXPECTED
+    # __all__ must have no duplicates.
+    assert len(abstract_harness.robot.core.__all__) == len(set(abstract_harness.robot.core.__all__))
+
+
+def test_public_names_are_importable() -> None:
+    for name in abstract_harness.robot.core.__all__:
+        assert hasattr(abstract_harness.robot.core, name), f"{name} declared in __all__ but missing"

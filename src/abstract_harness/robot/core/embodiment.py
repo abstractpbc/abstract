@@ -1,0 +1,232 @@
+"""The Embodiment interface — the second swappable input of an evaluation.
+
+An ``Embodiment`` is the "body + world": a real robot or a
+simulator. It
+produces observations, executes actions, and owns the action/observation spaces,
+the native control rate, and reset/safety machinery.
+
+Designed around real-robot reality: ``reset`` may drive to a home pose and block
+on human confirmation; there is no guaranteed privileged success oracle.
+Simulators are a stricter special case that opt into extra ``capabilities``.
+
+Per R1 (see the design doc): ``rollout()`` applies no wall-clock pacing of its
+own — ``step()`` is called as fast as the policy/controller/approver can
+produce actions. An embodiment that needs real-time cadence (e.g. matching a
+real robot's control period) paces itself inside ``step()``, and declares the
+``"self_paced"`` capability to document that it does.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+import numpy as np
+
+from abstract_harness.robot.core.approver import GuardrailContribution
+from abstract_harness.robot.core.scene import Scene
+from abstract_harness.robot.core.spaces import (
+    ActionSemantics,
+    Box,
+    CameraSpec,
+    ObservationSpace,
+    StateField,
+    StateSpec,
+)
+from abstract_harness.robot.core.types import Action, Observation, StepResult
+
+if TYPE_CHECKING:
+    from abstract_harness.robot.core.task import TaskEnvelope
+
+# Opt-in capability flags an embodiment may advertise.
+Capability = str
+SEEDABLE: Capability = "seedable"
+RESETTABLE: Capability = "resettable"
+AUTO_RESET: Capability = "auto_reset"
+PRIVILEGED_SUCCESS: Capability = "privileged_success"
+RENDERABLE: Capability = "renderable"
+SELF_PACED: Capability = "self_paced"
+
+
+@dataclass(frozen=True)
+class EmbodimentInfo:
+    """Static description of an embodiment for compatibility checking + logging.
+
+    ``docs`` contains free-form markdown operating notes for policies that can
+    read text, such as joint layout and positive directions, zero-pose
+    geometry, gripper polarity, frame conventions, and workspace hints. Keep
+    it concise because consumers inject it into system prompts verbatim.
+    ``None`` means no notes are offered; consumers must treat empty and
+    whitespace-only strings the same as absence.
+    """
+
+    name: str
+    action_space: Box
+    observation_space: ObservationSpace
+    control_hz: float | None = None
+    is_simulated: bool = False
+    capabilities: frozenset[Capability] = field(default_factory=frozenset)
+    # Setup-hook names and target kinds this embodiment can realize (for R7
+    # scene-realizability checks). Empty means "unconstrained" for the tracer.
+    supported_setups: frozenset[str] = field(default_factory=frozenset)
+    supported_target_kinds: frozenset[str] = field(default_factory=frozenset)
+    docs: str | None = None
+    # Environment provenance (e.g. simulator build ID, hardware rig ID).
+    environment_id: str | None = None
+    # Scene/asset revision hash or tag.
+    environment_revision: str | None = None
+
+
+@runtime_checkable
+class Embodiment(Protocol):
+    """The robot/simulator contract.
+
+    Embodiments may additionally define an **optional** ``bind_task(envelope)``
+    hook (not part of this Protocol, so existing embodiments stay conformant):
+    after compatibility checking, ``eval()`` calls it with the task's resolved
+    ``TaskEnvelope`` before the
+    first reset, letting adapters learn the rollout horizon — e.g. an operator
+    countdown showing elapsed/total. A seconds-based task is converted to
+    integer steps using ``info.control_hz`` before the hook fires. The hook is
+    optional *input*, not a guarantee: it never fires on direct ``rollout()``
+    calls or on older cores, so adapters must keep a graceful fallback. It
+    fires once per ``eval()``, which can be several times over an embodiment's
+    lifetime; each call replaces the previous envelope. ``EmbodimentBase``
+    ships a no-op default.
+
+    Embodiments may additionally offer an optional
+    ``connect_operator_session(session)`` hook. Accepting the session is a
+    stand-down promise for that run: the embodiment must never read stdin or
+    print its own status output after the call. The session provides
+    ``status(line)`` for an in-place status line, ``write_line(text)`` for
+    scrollback that safely repaints that status, and ``gate(prompt, hint=...)``
+    for blocking readiness confirmation. A gate flushes stale fd input first
+    and raises ``EmbodimentFault`` when
+    stdin is unavailable, with remedies and the embodiment's optional hint.
+    The hook is optional input, not a guarantee. It never fires under
+    ``--no-prompt``, without a TTY, on Windows, from direct ``rollout()`` or
+    ``eval()`` calls, or on older cores. An embodiment must keep a graceful
+    fallback and a working end-of-episode path whenever the hook does not fire.
+    The hook stays outside this Protocol so older embodiments remain
+    conformant.
+
+    Embodiments may additionally offer an optional ``observe_parked()`` hook:
+    when a scored trial is about to be graded, ``eval()`` calls it so the
+    embodiment can move itself to its parked/rest pose and return one fresh
+    ``Observation`` whose cameras see the
+    scene unobstructed; the vlm grader then judges those final frames instead
+    of the last step's. Returning ``None`` declines (right when parking would
+    alter the state being graded, e.g. a held object). Raising
+    ``SafetyAbort`` or
+    ``EmbodimentFault`` halts the eval;
+    any other failure degrades to last-step frames with a ``RuntimeWarning``.
+    The hook is optional input, not a guarantee: it never fires on direct
+    ``rollout()`` calls, without a grading hook, or on older cores, and it
+    stays outside this Protocol so older embodiments remain conformant.
+
+    The optional ``defer_operator_end()`` hook is superseded by
+    ``connect_operator_session`` but remains supported. An embodiment that
+    polls stdin for the end-of-episode keypress must stop doing so when called;
+    the framework console owns stdin for that run. Offering this legacy hook
+    is also how a real-hardware embodiment declares itself console-safe to
+    cores and adapters that have not adopted the session hook.
+
+    Embodiments may also define an **optional**
+    ``contribute_guardrails(self, action_space: Box) -> GuardrailContribution``
+    hook, likewise omitted from this Protocol so existing implementations
+    remain runtime-conformant. The CLI calls it with the resolved action space
+    and appends its contribution after the generic clamp and delta limiter.
+    Direct ``rollout()`` and programmatic ``eval()`` callers compose their own
+    approvers, so the hook is CLI input rather than a universal callback.
+    ``EmbodimentBase`` returns an empty contribution by default.
+    """
+
+    info: EmbodimentInfo
+
+    def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
+        """Prepare a scene and return its initial observation, using ``seed`` if supported."""
+        ...
+
+    def step(self, action: Action) -> StepResult:
+        """Issue one action. The rollout does not wait for the control period between
+        calls; declare ``"self_paced"`` if this embodiment paces itself to real time.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release hardware, simulator, or transport resources held by the adapter."""
+        ...
+
+
+class EmbodimentBase(ABC):
+    """Optional base class with a no-op ``close``; inherit for the convenience."""
+
+    info: EmbodimentInfo
+
+    @abstractmethod
+    def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
+        """Prepare a scene and return its initial observation, using ``seed`` if supported."""
+        ...
+
+    @abstractmethod
+    def step(self, action: Action) -> StepResult:
+        """Issue one action. The rollout does not wait for the control period between
+        calls; declare ``"self_paced"`` if this embodiment paces itself to real time.
+        """
+        ...
+
+    def bind_task(self, envelope: TaskEnvelope) -> None:  # noqa: B027 - no-op default
+        """Default: embodiments with nothing to display or pre-allocate ignore it."""
+
+    def contribute_guardrails(self, action_space: Box) -> GuardrailContribution:
+        """Default: embodiments without specialized safety gates contribute nothing."""
+        return GuardrailContribution()
+
+    def close(self) -> None:  # noqa: B027 - intentional no-op default
+        """Default: nothing to release."""
+
+
+def joint_embodiment_info(
+    name: str,
+    *,
+    low: Sequence[float],
+    high: Sequence[float],
+    dim_labels: Sequence[str] | None = None,
+    cameras: Sequence[CameraSpec] = (),
+    control_hz: float = 30.0,
+    state_key: str = "joint_pos",
+    control_mode: str = "joint_pos",
+    docs: str | None = None,
+) -> EmbodimentInfo:
+    """Build a doctor-conformant `EmbodimentInfo` for any joint-space robot in one call.
+
+    Automatically wires `Box` bounds, `ActionSemantics(dim_labels=...)`, `ObservationSpace`,
+    and the matching proprioceptive `StateSpec` field required by `check_embodiment`.
+    """
+    low_arr = np.asarray(low, dtype=np.float64)
+    high_arr = np.asarray(high, dtype=np.float64)
+    dim = int(low_arr.shape[0])
+    labels = tuple(dim_labels) if dim_labels is not None else tuple(f"j{i}" for i in range(dim))
+    action_space = Box(
+        shape=(dim,),
+        low=low_arr,
+        high=high_arr,
+        semantics=ActionSemantics(
+            control_mode=control_mode,  # type: ignore[arg-type]
+            dim_labels=labels,
+        ),
+    )
+    obs_space = ObservationSpace(
+        cameras=tuple(cameras),
+        state_keys=frozenset({state_key}),
+        state=StateSpec((StateField(key=state_key, shape=(dim,), unit="rad"),)),
+    )
+    return EmbodimentInfo(
+        name=name,
+        action_space=action_space,
+        observation_space=obs_space,
+        control_hz=float(control_hz),
+        docs=docs,
+    )

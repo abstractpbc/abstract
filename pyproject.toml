@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "abstract-harness"
+version = "0.1.0"
+description = "Simple, safety-gated harness for running and evaluating robotics policies in simulation and on physical hardware"
+readme = "README.md"
+license = "Apache-2.0 AND MIT"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "src/abstract_harness/robot/yam/assets/MENAGERIE_LICENSE"]
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "httpx>=0.28,<0.29",
+  "numpy>=1.24,<3",
+  "pillow>=10,<13",
+  "pydantic>=2.11,<3",
+  "websockets>=12",
+]
+
+[project.scripts]
+abstract = "abstract_harness.cli:main"
+abstract-harness = "abstract_harness.cli:main"
+
+[project.optional-dependencies]
+# Embodiment-agnostic physical robot runtime: Rerun (.rrd) recordings, LeRobot v3 dataset
+# export (pyarrow + PyAV), OpenCV frame handling, MuJoCo collision checking, and HTTP clients.
+# Pure PyPI wheels: `uv sync --extra robot`.
+robot = [
+  "rerun-sdk>=0.24",
+  "pyarrow>=21",
+  "av>=18.1,<20",
+  "json-numpy>=2.1",
+  "requests>=2.31",
+  "opencv-python-headless>=4.8,<5",
+  "mujoco>=3.3.1",
+]
+# Bimanual YAM runtime plus Intel RealSense on Linux. From a source checkout use
+# `uv sync --extra yam --group yam-driver` for the separately pinned native driver.
+yam = [
+  "rerun-sdk>=0.24",
+  "pyarrow>=21",
+  "av>=18.1,<20",
+  "json-numpy>=2.1",
+  "requests>=2.31",
+  "opencv-python-headless>=4.8,<5",
+  "mujoco>=3.3.1",
+  "pyrealsense2>=2.50; sys_platform == 'linux'",
+]
+
+[tool.uv]
+# ruckig 0.15.3 (from i2rt) builds from source here, with a config scikit-build-core 0.10
+# rejects ("Use build.targets instead of cmake.targets").
+build-constraint-dependencies = ["scikit-build-core<0.10"]
+
+[tool.uv.sources]
+# Immutable driver source. Moving this pin requires a new hardware acceptance run.
+i2rt = { git = "https://github.com/i2rt-robotics/i2rt", rev = "ac096928d6899ddf852a71c5e8fbaa6055cd9745" }
+
+[dependency-groups]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<2", "ruff>=0.11,<1"]
+# Source-checkout hardware installation. Wheel extras never resolve a bare, unpinned i2rt.
+yam-driver = ["i2rt"]
+typing = ["mypy>=2.4,<3"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/abstract_harness/_security.py", "src/abstract_harness/_signals.py", "src/abstract_harness/robot/core/supervision.py", "src/abstract_harness/robot/core/safety.py", "src/abstract_harness/robot/vla.py"]
+follow_imports = "skip"
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "real_kinematics: requires the yam-driver group's i2rt, mink and mujoco kinematics",
+  "perf: generous wall-clock regression check",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
