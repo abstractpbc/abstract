@@ -88,10 +88,34 @@ inference frames. A direct caller must supply intermediate observations through 
 Session IDs, step numbers, dimensions, rates and frame counts are checked before accepting a reply.
 Model availability and any model-weight licenses belong to the serving provider.
 
+## Your robot, live control and the orchestrator
+
+- **Robot presets** ([PRESETS.md](docs/PRESETS.md)) describe any robot in TOML. A preset
+  points at its URDF or MJCF, selects and orders the joints a policy drives, narrows
+  their limits, and sets the policy rate and the driver's servo rate. It also names end
+  effectors, cameras and sensor frames, and maps gamepad axes and buttons. The `preset`
+  embodiment runs it through your driver class, or through a built-in kinematic
+  simulator for dry runs. See [robots/](robots/), including a Unitree G1 template.
+- **Locomotion**: a `base_vel` action (vx, vy, yaw rate) with an acceleration limit, a
+  watchdog and fall detection, standard base and IMU state, the agent's `drive` tool, and
+  a `teleop` policy for gamepad driving through the same guardrails.
+- **Strict timing and async inference** ([LIVE_CONTROL.md](docs/LIVE_CONTROL.md)):
+  `--strict-timing` holds every step to the robot's configured rate and records missed
+  deadlines. `--async-inference` infers the next chunk while the current one plays.
+- **Live commands**: stream joystick or program inputs (go/stop, speed, turn) into a
+  running policy as `observation.extra["commands"]`. Sources are a gamepad, UDP, or
+  serve's `command` RPC; values stop when their source does.
+- **The orchestrator** ([ORCHESTRATOR.md](docs/ORCHESTRATOR.md)): an LLM that runs trained
+  policies and skills as tools. A tool call returns a job id at once. The job runs on the
+  control loop and streams events back to the model, which can wait, stop or steer it.
+  Tools come from extension modules, Pi-style.
+
+All of these are opt-in. Without them, runs behave as before.
+
 ## Configure a robot
 
 The examples in [rigs/](rigs/) declare policy, embodiment, recording formats and optional
-storage. All examples are checked against the actual factories without opening hardware.
+storage; `[rig] preset = "..."` runs a robot preset instead of the YAM adapter. All examples are checked against the actual factories without opening hardware.
 Use a local copy with the rig's real interfaces, camera identities, limits and measured geometry.
 
 For a prepared YAM rig, the operator runs:
@@ -145,6 +169,7 @@ uv run abstract robot video <run_dir>
 ## Extending and contributing
 
 See [ADAPTERS.md](docs/ADAPTERS.md) for a complete fake adapter, lifecycle ownership and units;
+[PRESETS.md](docs/PRESETS.md) to describe a robot and write its driver instead;
 [ROBOT.md](docs/ROBOT.md) for the YAM runbook and storage; [RPC.md](docs/RPC.md) for the
 operator server; and [AGENTS.md](AGENTS.md) for coding-agent architecture and invariants.
 [CONTRIBUTING.md](CONTRIBUTING.md) describes validation and release gates.

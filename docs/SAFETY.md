@@ -68,6 +68,25 @@ RPC `stop` and `abort` are cooperative operator controls. `episode_end`, `run_en
 exit and a successful HTTP response are software events, not independent physical state
 measurements. Keep a hardware stop reachable, and measure stop behavior on each rig.
 
+## Pacing, live commands and supervised tools
+
+Strict timing paces dispatch at a fixed rate and can halt after sustained lateness; it is
+not a real-time guarantee. Python sleep resolution, garbage collection and native calls
+can still delay a step, and the report records what happened. Async inference holds
+(last absolute target, or zero for displacements and velocities) when no fresh action is
+ready; it never invents motion.
+
+Live commands are inputs to a policy. They reach a robot only through the policy's
+actions and the approver chain, return to rest when their source stops, and a gamepad
+button that ends an episode is not an emergency stop. Network command sources bind
+loopback by default and carry no authentication.
+
+Preset embodiments stop rate-mode drivers when steps stop arriving, end the episode past
+a configured tilt, and gate physical motion on the operator. These are software
+supervisors over the driver's own protections, not substitutes for them. The orchestrator
+runs its model on a separate thread that cannot call behaviors or actuators; jobs run on
+the rollout thread and their composed actions pass the same approver chain.
+
 ## Data and timing
 
 Numeric observation/action buffers are snapshotted for retained trial records. Custom
