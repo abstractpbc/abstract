@@ -136,6 +136,11 @@ class Toolset:
             self._positive_limits = high
             self._negative_limits = np.abs(low)
 
+    @property
+    def move_tool(self) -> str:
+        """The motion tool's name: move_joints, move_to, move_by or drive."""
+        return self._move_tool
+
     def state_labels(self) -> tuple[str, tuple[str, ...]] | None:
         """Return the state field and per-element labels selected at build time."""
         return self._state_labels

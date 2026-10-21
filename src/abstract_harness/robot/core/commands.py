@@ -1384,8 +1384,8 @@ def _build_and_announce_guardrails(
 def _announce_live_view(
     policy_name: str, log_dir: str, env: Mapping[str, str] = os.environ
 ) -> None:
-    """Print the copyable browser-view command for agent runs."""
-    if policy_name != "agent":
+    """Print the copyable browser-view command for agent and orchestrator runs."""
+    if policy_name not in ("agent", "orchestrator"):
         return
     quoted = shlex.quote(log_dir)
     headless = _headless_session(env)

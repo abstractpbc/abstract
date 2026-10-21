@@ -29,6 +29,7 @@ KINDS: tuple[Kind, ...] = (
 BUNDLED: dict[Kind, dict[str, str]] = {
     "policy": {
         "agent": "abstract_harness.robot.agent.policy:agent_policy",
+        "orchestrator": "abstract_harness.robot.orchestrator.policy:orchestrator_policy",
         "policy": "abstract_harness.robot.vla:vla_policy",
     },
     "embodiment": {

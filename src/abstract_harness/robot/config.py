@@ -114,6 +114,9 @@ class AgentPricing(Pricing):
 
 
 class AgentConfig(Record):
+    # "agent" drives the robot through its motion tools; "orchestrator" runs extension
+    # tools (trained policies, skills) as background jobs and watches their events.
+    policy: Literal["agent", "orchestrator"] = "agent"
     model: Annotated[str, Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9._:-]+$")]
     pricing: AgentPricing
     # OpenAI bills a request with more input tokens than this at long-context rates. The
@@ -400,7 +403,7 @@ class RobotConfig(Record):
 
     @property
     def policy_name(self) -> str:
-        return "agent" if self.agent is not None else self.vla.policy  # type: ignore[union-attr]
+        return self.agent.policy if self.agent is not None else self.vla.policy  # type: ignore[union-attr]
 
     def policy_args(self, base_url: str | None = None) -> dict[str, Scalar]:
         """The policy's constructor arguments; an agent's base_url is the meter's."""
@@ -440,6 +443,22 @@ class RobotConfig(Record):
             return value if value.is_absolute() else base / value
 
         rig, store = loaded.rig, loaded.store
+        agent = loaded.agent
+        if agent is not None and isinstance(agent.args.get("extensions"), str):
+            # Extension files, like log_root, are relative to this file; module names stay.
+            resolved = []
+            for entry in (item.strip() for item in str(agent.args["extensions"]).split(",")):
+                target, sep, attribute = entry.rpartition(":")
+                if not sep:
+                    target, attribute = entry, ""
+                if target.endswith(".py"):
+                    target = str(absolute(Path(target)).resolve())
+                    entry = f"{target}:{attribute}" if attribute else target
+                if entry:
+                    resolved.append(entry)
+            args = {**agent.args, "extensions": ",".join(resolved)}
+            agent = agent.model_copy(update={"args": args})
+            loaded = loaded.model_copy(update={"agent": agent})
         rig_update: dict[str, Any] = {"log_root": absolute(rig.log_root)}
         if rig.preset is not None:
             rig_update["preset"] = absolute(rig.preset)
