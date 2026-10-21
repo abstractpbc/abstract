@@ -77,4 +77,6 @@ def main(args: argparse.Namespace, **seams: Any) -> int:
         config = RobotConfig.load(args.config)
     except (OSError, ValueError) as exc:
         parser.error(f"{args.config}: {exc}")
+    if config.rig.type != "yam_arms":
+        parser.error(f"{args.tool} is a YAM tool; {args.config} configures a {config.rig.type} rig")
     return _modules()[args.tool].run_command(parser, args, config.embodiment_args(), **seams)

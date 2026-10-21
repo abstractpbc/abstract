@@ -1614,6 +1614,9 @@ def doctor(embodiment: str, embodiment_args: Mapping[str, Any], source: str) -> 
         print(f"  [error] runtime-requirement: {module} missing → {remedy}")
     built = _resolve_or_exit("embodiment", embodiment, **embodiment_args)
     try:
+        notes = getattr(built, "doctor_notes", None)
+        if callable(notes):
+            print(notes())
         report = check_embodiment(built.info)
     finally:
         built.close()

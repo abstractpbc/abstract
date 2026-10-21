@@ -1,0 +1,145 @@
+# A Unitree G1 (29 DoF) preset template: whole-body joint-position control at 50 Hz, two
+# custom end effectors, the IMU state a locomotion policy reads, gamepad velocity commands
+# and fall detection (docs/PRESETS.md).
+#
+# 1. Put your G1 model next to this file as g1_29dof.urdf (unitree_ros, robots/g1_description)
+#    or point model at it; an MJCF (mujoco_menagerie unitree_g1) works too.
+# 2. Rename the end effectors, their frames and joints to yours.
+# 3. Check it without hardware, then dry-run it in the simulator:
+#
+#      uv run abstract robot check --config rigs/your-g1.toml
+#      uv run abstract eval --embodiment preset -E preset=robots/unitree-g1/preset.toml \
+#          -E driver=sim --policy teleop --instruction "stand" --strict-timing --no-prompt
+#
+# 4. Fill in g1_driver.py with your SDK calls (driver = "g1_driver.py:G1Driver") before a
+#    physical run. Frame and joint names below follow Unitree's g1_29dof URDF; check prints
+#    close matches when yours differ.
+
+[robot]
+name = "g1"
+model = "g1_29dof.urdf"
+# The policy steps at 50 Hz and strict timing holds it there; the driver's PD loop runs at
+# 500 Hz between policy steps.
+policy_hz = 50
+control_hz = 500
+mode = "joint_pos"
+driver = "g1_driver.py:G1Driver"
+command_events = ["go", "stop"]
+description = "Unitree G1 humanoid. Joint targets are absolute angles in radians; the legs balance, so move them only through a trained locomotion policy."
+
+[robot.driver_args]
+network_interface = "eth0"
+
+[robot.joints]
+# Unitree's motor order (LowCmd motor 0..28), then the custom end effectors.
+select = [
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint",
+    "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint",
+    "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_*", "left_elbow_joint", "left_wrist_*",
+    "right_shoulder_*", "right_elbow_joint", "right_wrist_*",
+    "left_ee_joint", "right_ee_joint",
+]
+# A preset only narrows the model's limits. Tune max_step to what your policies need:
+# without it, a step may move each joint at most 5% of its range.
+max_step = { "*_hip_*" = 0.08, "*_knee_joint" = 0.1, "*_ankle_*" = 0.08, "waist_*" = 0.03, "*_shoulder_*" = 0.04, "*_elbow_joint" = 0.04, "*_wrist_*" = 0.05, "*_ee_joint" = 0.005 }
+# A crouched standing pose, ramped from wherever the robot is at reset.
+home = { "*_hip_pitch_joint" = -0.1, "*_knee_joint" = 0.3, "*_ankle_pitch_joint" = -0.2, "*_elbow_joint" = 0.9 }
+home_secs = 3.0
+
+[[robot.joint]]
+# A custom end effector the model does not have: one prismatic gripper joint per wrist.
+name = "left_ee_joint"
+type = "prismatic"
+lower = 0.0
+upper = 0.05
+
+[[robot.joint]]
+name = "right_ee_joint"
+type = "prismatic"
+lower = 0.0
+upper = 0.05
+
+[robot.parts]
+left_leg = ["left_hip_*", "left_knee_joint", "left_ankle_*"]
+right_leg = ["right_hip_*", "right_knee_joint", "right_ankle_*"]
+waist = ["waist_*"]
+left_arm = ["left_shoulder_*", "left_elbow_joint", "left_wrist_*"]
+right_arm = ["right_shoulder_*", "right_elbow_joint", "right_wrist_*"]
+left_ee = ["left_ee_joint"]
+right_ee = ["right_ee_joint"]
+
+[[robot.end_effectors]]
+name = "left_gripper"
+frame = "left_wrist_yaw_link"
+offset = [0.12, 0.0, 0.0]
+joints = ["left_ee_joint"]
+kind = "gripper"
+description = "parallel gripper; left_ee_joint is the jaw gap in metres, 0 closed, 0.05 open"
+
+[[robot.end_effectors]]
+name = "right_gripper"
+frame = "right_wrist_yaw_link"
+offset = [0.12, 0.0, 0.0]
+joints = ["right_ee_joint"]
+kind = "gripper"
+description = "parallel gripper; right_ee_joint is the jaw gap in metres, 0 closed, 0.05 open"
+
+[[robot.cameras]]
+name = "head_cam"
+frame = "d435_link"
+width = 640
+height = 480
+description = "RealSense D435 in the head, looking forward and down"
+
+[[robot.sensors]]
+name = "pelvis_imu"
+frame = "imu_in_pelvis"
+kind = "imu"
+
+[robot.state]
+# What a locomotion policy reads: joint state, the pelvis IMU's angular velocity and the
+# gravity direction in the pelvis frame.
+fields = ["joint_pos", "joint_vel", "base_ang_vel", "projected_gravity"]
+
+[robot.base]
+# Joint-position control: no base velocity action, but fall detection applies.
+max_tilt_deg = 45
+
+# The velocity commands a locomotion policy reads (observation.extra["commands"]).
+[[robot.commands]]
+name = "vx"
+low = -0.5
+high = 1.0
+description = "forward speed, m/s"
+
+[[robot.commands]]
+name = "vy"
+low = -0.4
+high = 0.4
+description = "lateral speed, m/s, positive to the left"
+
+[[robot.commands]]
+name = "yaw_rate"
+low = -1.0
+high = 1.0
+description = "turn rate, rad/s, positive to the left"
+
+[[robot.controllers]]
+name = "pad"
+kind = "joystick"
+device = "/dev/input/js0"
+layout = "xbox"
+deadman = "lb"
+
+[robot.controllers.axes]
+vx = { axis = "ly", scale = -1.0 }
+vy = { axis = "lx", scale = -0.4 }
+yaw_rate = { axis = "rx", scale = -1.0 }
+
+[robot.controllers.buttons]
+a = "go"
+b = "stop"
+start = "end_episode"

@@ -73,7 +73,11 @@ def test_the_tools_get_the_embodiment_args_a_run_gets(tmp_path: Path) -> None:
     assert YamConfig.from_kwargs(**args).rest_pose == (0.0,) * 14
 
 
-@pytest.mark.parametrize("rig", sorted(RIGS.glob("*.toml")), ids=lambda path: path.name)
+@pytest.mark.parametrize(
+    "rig",
+    [path for path in sorted(RIGS.glob("*.toml")) if RobotConfig.load(path).rig.type == "yam_arms"],
+    ids=lambda path: path.name,
+)
 def test_the_committed_rigs_configure_the_tools(rig: Path) -> None:
     # The tools see the rig a run sees: every [rig.embodiment] value, lists as tuples.
     config = RobotConfig.load(rig)

@@ -119,7 +119,15 @@ class SmoothingController:
 _ENSEMBLE_KEY = "_ensemble_chunks"
 # Control modes whose actions live in a vector space and may be linearly averaged.
 _AVERAGEABLE_MODES = frozenset(
-    {"joint_pos", "joint_vel", "joint_delta", "eef_delta_pos", "eef_abs_pose", "eef_delta_pose"}
+    {
+        "joint_pos",
+        "joint_vel",
+        "joint_delta",
+        "eef_delta_pos",
+        "eef_abs_pose",
+        "eef_delta_pose",
+        "base_vel",
+    }
 )
 # Rotation representations that survive linear averaging. "none" has no rotation;
 # "rot6d" is averaged un-normalized here on the assumption the consumer applies

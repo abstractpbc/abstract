@@ -31,7 +31,10 @@ BUNDLED: dict[Kind, dict[str, str]] = {
         "agent": "abstract_harness.robot.agent.policy:agent_policy",
         "policy": "abstract_harness.robot.vla:vla_policy",
     },
-    "embodiment": {"yam_arms": "abstract_harness.robot.yam.embodiment:YAMEmbodiment"},
+    "embodiment": {
+        "yam_arms": "abstract_harness.robot.yam.embodiment:YAMEmbodiment",
+        "preset": "abstract_harness.robot.preset.embodiment:PresetEmbodiment",
+    },
 }
 
 

@@ -109,7 +109,7 @@ def test_underrun_holds_the_last_absolute_target() -> None:
     assert store[_REPORT_KEY]["holds"] >= 1
 
 
-@pytest.mark.parametrize("mode", ["joint_delta", "eef_delta_pos", "joint_vel"])
+@pytest.mark.parametrize("mode", ["joint_delta", "eef_delta_pos", "joint_vel", "base_vel"])
 def test_underrun_sends_zeros_for_rate_and_displacement_modes(mode: str) -> None:
     policy = StepPolicy(mode=mode, horizon=1)
     controller = AsyncController(prefetch=0)

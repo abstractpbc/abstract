@@ -283,6 +283,48 @@ class DeltaLimitApprover:
         return replace(action, data=approved, meta={**dict(action.meta), "delta_clamped": True})
 
 
+class AccelerationLimitApprover:
+    """Limit how fast a rate command changes: the acceleration limit for velocity modes.
+
+    For ``joint_vel`` and ``base_vel`` spaces, the bounds clamp and the delta limit cap
+    the commanded *velocity*; this caps its change per control step, so a policy (or an
+    operator's stick) cannot jump a walking base from full speed to full reverse in one
+    step. Each dimension moves at most ``max_change`` (native units per step; derive it
+    as acceleration / control rate) from the last approved command, starting from rest
+    (zeros) at every trial. A decelerating command is limited too, so stopping ramps; the
+    embodiment's own watchdog or stop path is what halts at once. A modified action is
+    flagged ``meta["accel_clamped"]``; ``NaN`` raises ``SafetyAbort``.
+    """
+
+    def __init__(self, action_space: Box, max_change: float | Any):
+        from abstract_harness.robot.core.spaces import RATE_CONTROL_MODES
+
+        sem = action_space.semantics
+        if sem is None or sem.control_mode not in RATE_CONTROL_MODES:
+            raise ValueError(
+                "AccelerationLimitApprover applies to rate control modes "
+                f"({sorted(RATE_CONTROL_MODES)}) only"
+            )
+        self._max = _validate_max_delta(max_change, action_space.shape, action_space.dim)
+        self._key = f"accel_limit:{id(self)}"
+
+    def begin_trial(self, reference: Any, store: dict[str, Any]) -> None:
+        """Every trial starts from rest, whatever the measured reference."""
+        store[self._key] = np.zeros_like(self._max)
+
+    def review(self, action: Action, store: dict[str, Any]) -> Action:
+        """Clamp the change from the previous approved command."""
+        data = np.asarray(action.data, dtype=np.float64)
+        if bool(np.isnan(data).any()):
+            raise SafetyAbort("AccelerationLimitApprover: action contains NaN")
+        previous = np.asarray(store.get(self._key, np.zeros_like(self._max)), dtype=np.float64)
+        approved = np.clip(data, previous - self._max, previous + self._max)
+        store[self._key] = approved.copy()
+        if np.array_equal(approved, data):
+            return action
+        return replace(action, data=approved, meta={**dict(action.meta), "accel_clamped": True})
+
+
 def _validate_max_delta(
     max_delta: float | Any, shape: tuple[int, ...], dim: int
 ) -> npt.NDArray[np.float64]:

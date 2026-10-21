@@ -46,6 +46,7 @@ AGENT_TIMEOUT_MARGIN_S = 10.0
 PROTECTED_VLA_ARGS = frozenset({"server_url"})
 
 EMBODIMENT = "yam_arms"
+PRESET = "preset"
 
 # Constructor arguments for a policy or embodiment, as TOML values. A list reaches the
 # component as one comma-separated string, the form of its -E/-P KEY=VALUE flags, which
@@ -175,7 +176,8 @@ class ActionPolicyConfig(Record):
     """An action policy (VLA or World-Action Model) on a cloud `/v1` gateway, a local
     `/v1` or `/act` server, or an in-process local model (`target` in `args`)."""
 
-    policy: Literal["policy", "molmoact2", "gr00t"] = "policy"
+    # "teleop" maps live commands (a preset's gamepad) onto the action; it has no server.
+    policy: Literal["policy", "molmoact2", "gr00t", "teleop"] = "policy"
     server_url: str = "https://api.abstract.inc/v1"
     # The policy client's arguments other than server_url, e.g. model, target, or camera size.
     args: Args = Field(default_factory=dict)
@@ -187,6 +189,10 @@ class ActionPolicyConfig(Record):
         if PROTECTED_VLA_ARGS & set(self.args):
             raise ValueError("[vla.args] cannot set server_url; set it in [vla]")
         _check_args("vla.args", self.args)
+        if self.policy == "teleop":
+            if "server_url" in self.model_fields_set:
+                raise ValueError('[vla] policy = "teleop" has no server_url')
+            return self
         if (
             self.policy == "policy"
             and "target" in self.args
@@ -207,8 +213,13 @@ class ActionPolicyConfig(Record):
             raise ValueError("server_url must be a plain http(s) base URL, e.g. http://host:8202")
         return self
 
+    @property
+    def endpoint(self) -> str | None:
+        """Where the policy's actions come from: its server, or None for teleop."""
+        return None if self.policy == "teleop" else self.server_url
+
     def policy_args(self) -> dict[str, Scalar | list[Scalar]]:
-        if (
+        if self.policy == "teleop" or (
             self.policy == "policy"
             and "target" in self.args
             and "server_url" not in self.model_fields_set
@@ -305,6 +316,9 @@ class RigConfig(Record):
     name: Annotated[str, Field(pattern=ROBOT_NAME)] = Field(default_factory=default_rig_name)
     # Registered embodiment name (default "yam_arms"; e.g. "franka", "so100", "cubepick").
     type: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")] = EMBODIMENT
+    # A robot preset TOML (docs/PRESETS.md), relative to this file: the rig is then the
+    # "preset" embodiment, and [rig.embodiment] overrides its driver, pace or driver_args.
+    preset: Path | None = None
     # Embodiment constructor arguments: CAN channels, cameras, control mode, limits.
     embodiment: Args = Field(default_factory=dict)
     # Relative paths resolve against the directory of the TOML file.
@@ -318,8 +332,21 @@ class RigConfig(Record):
     # Infer the next action chunk while the current one plays (AsyncController).
     async_inference: StrictBool = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def preset_type(cls, data: Any) -> Any:
+        if isinstance(data, Mapping) and data.get("preset") is not None:
+            if data.get("type", PRESET) != PRESET:
+                raise ValueError(f'[rig] preset needs type = "{PRESET}" (or no type)')
+            if "preset" in (data.get("embodiment") or {}):
+                raise ValueError("set the preset in [rig] preset, not [rig.embodiment]")
+            return {**data, "type": PRESET}
+        return data
+
     @model_validator(mode="after")
     def channels_explicit(self) -> Self:
+        if self.type == PRESET and self.preset is None and "preset" not in self.embodiment:
+            raise ValueError('[rig] type = "preset" needs [rig] preset = "<robot preset TOML>"')
         # Which CAN interface drives which arm depends on the rig's wiring, and yam_arms'
         # defaults (left can0, right can1) are only a guess; never rely on them.
         if self.type == EMBODIMENT and not {"left_channel", "right_channel"} <= set(
@@ -382,8 +409,11 @@ class RobotConfig(Record):
         return component_args(self.vla.policy_args())  # type: ignore[union-attr]
 
     def embodiment_args(self) -> dict[str, Scalar]:
-        """yam_arms' constructor arguments."""
-        return component_args(self.rig.embodiment)
+        """The embodiment's constructor arguments (a preset rig's include its path)."""
+        args = component_args(self.rig.embodiment)
+        if self.rig.preset is not None:
+            args = {"preset": str(self.rig.preset), **args}
+        return args
 
     def setup(self, base_url: str | None = None) -> dict[str, Any]:
         """Every argument a run of this config gives its components."""
@@ -410,9 +440,12 @@ class RobotConfig(Record):
             return value if value.is_absolute() else base / value
 
         rig, store = loaded.rig, loaded.store
+        rig_update: dict[str, Any] = {"log_root": absolute(rig.log_root)}
+        if rig.preset is not None:
+            rig_update["preset"] = absolute(rig.preset)
         return loaded.model_copy(
             update={
-                "rig": rig.model_copy(update={"log_root": absolute(rig.log_root)}),
+                "rig": rig.model_copy(update=rig_update),
                 "store": store and store.model_copy(update={"env_file": absolute(store.env_file)}),
             }
         )

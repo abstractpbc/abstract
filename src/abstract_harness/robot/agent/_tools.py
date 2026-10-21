@@ -32,6 +32,8 @@ from abstract_harness.robot.core.spaces import (
 from abstract_harness.robot.core.types import Action, ActionChunk, Observation
 
 _DISPLACEMENT_MODES = frozenset({"eef_delta_pos", "eef_delta_pose", "joint_delta"})
+# Rate modes the agent can drive: a mobile base's velocity, held for a duration, then zero.
+_DRIVE_MODES = frozenset({"base_vel"})
 _POSE_MODES = frozenset({"eef_abs_pose", "eef_delta_pose"})
 _SAFE_ROT = frozenset({"none", "rot6d"})
 
@@ -100,8 +102,10 @@ class Toolset:
         images: str = "always",
         cameras: tuple[str, ...] = (),
         pre_check: PreCheck | None = None,
+        drive: bool = False,
     ):
         self._absolute = absolute
+        self._drive = drive
         self._pose = pose
         self._labels = labels
         self._index_by_label = {label: i for i, label in enumerate(labels)}
@@ -110,7 +114,9 @@ class Toolset:
         self._hz = control_hz
         self._resolved_hz = control_hz if control_hz is not None else _FALLBACK_HZ
         self._max_steps = math.ceil(_MAX_DURATION_S * self._resolved_hz)
-        if pose:
+        if drive:
+            self._move_tool = "drive"
+        elif pose:
             # Cartesian surfaces get a Cartesian name; the LLM should think in
             # workspace terms, not joints.
             self._move_tool = "move_to" if absolute else "move_by"
@@ -159,6 +165,15 @@ class Toolset:
                 "count. Unnamed dimensions hold their current value. " + self._bounds_text
             )
             values_key = "targets"
+        elif self._drive:
+            move_description = (
+                "Drive the mobile base at constant velocities for duration_s seconds, then "
+                "stop: every dimension returns to zero at the end. Velocities are in the "
+                "base frame (meters per second for linear, radians per second for yaw, per "
+                "the dimension labels). Unnamed dimensions are zero. Keep durations short "
+                "and re-check the observation after each drive. " + self._bounds_text
+            )
+            values_key = "velocities"
         else:
             move_description = (
                 "Move BY the given displacement per dimension. The motion is split "
@@ -196,6 +211,13 @@ class Toolset:
                 },
             },
         }
+        if self._drive:
+            parameters = move["function"]["parameters"]  # type: ignore[index]
+            parameters["properties"]["duration_s"] = {
+                "type": "number",
+                "description": f"How long to drive, in seconds (at most {_MAX_DURATION_S:g}).",
+            }
+            parameters["required"] = [values_key, "duration_s", "note"]
         done = {
             "type": "function",
             "function": {
@@ -389,7 +411,7 @@ class Toolset:
                 error=("note is required: describe what you observe and why you chose this motion")
             )
 
-        values_key = "targets" if self._absolute else "deltas"
+        values_key = "targets" if self._absolute else "velocities" if self._drive else "deltas"
         values = arguments.get(values_key)
         if not isinstance(values, dict) or not values:
             return ToolResult(error=f"{values_key} must be a non-empty object of name: value")
@@ -418,7 +440,36 @@ class Toolset:
         if self._absolute:
             assert current is not None
             return self._move_absolute(values, vector, named_indices, current)
+        if self._drive:
+            return self._move_drive(vector, named_indices, arguments.get("duration_s"))
         return self._move_displacement(vector, named_indices)
+
+    def _move_drive(
+        self,
+        vector: npt.NDArray[np.float64],
+        named_indices: list[int],
+        duration: object,
+    ) -> ToolResult:
+        if isinstance(duration, bool) or not isinstance(duration, int | float):
+            return ToolResult(error="duration_s must be a number of seconds")
+        if not math.isfinite(duration) or duration <= 0:
+            return ToolResult(error="duration_s must be finite and > 0")
+        if duration > _MAX_DURATION_S:
+            return self._cap_error()
+        for index in named_indices:
+            value = vector[index]
+            if value < self._low[index] or value > self._high[index]:
+                return ToolResult(
+                    error=(
+                        f"velocity for {self._labels[index]} is outside "
+                        f"[{float(self._low[index])!r}, {float(self._high[index])!r}]"
+                    )
+                )
+        steps = max(1, math.ceil(float(duration) * self._resolved_hz - _RELATIVE_HEADROOM))
+        actions = [Action(data=vector.copy()) for _ in range(steps)]
+        # The chunk ends at rest: a base never keeps the last commanded velocity.
+        actions.append(Action(data=np.zeros_like(vector)))
+        return self._success(actions, steps)
 
     def _move_absolute(
         self,
@@ -568,13 +619,13 @@ def build_toolset(
             f"rotation_repr {semantics.rotation_repr!r} cannot be driven per-dimension; "
             f"only {sorted(_SAFE_ROT)} are supported"
         )
-    if mode not in ABSOLUTE_CONTROL_MODES | _DISPLACEMENT_MODES:
+    if mode not in ABSOLUTE_CONTROL_MODES | _DISPLACEMENT_MODES | _DRIVE_MODES:
         raise ToolsetError(f"control_mode {mode!r} is not supported by the agent policy yet")
-    if pre_check is not None and mode in _DISPLACEMENT_MODES:
+    if pre_check is not None and mode in _DISPLACEMENT_MODES | _DRIVE_MODES:
         raise ToolsetError(
-            "pre_check cannot be used with displacement control modes: they emit "
-            "per-step delta vectors that a configuration checker would misread "
-            "(plan 0031)"
+            "pre_check cannot be used with displacement or velocity control modes: they "
+            "emit per-step delta or rate vectors that a configuration checker would "
+            "misread (plan 0031)"
         )
     if control_hz is not None and (not np.isfinite(control_hz) or control_hz <= 0):
         raise ToolsetError("control_hz must be finite and > 0 when declared")
@@ -632,7 +683,8 @@ def build_toolset(
     if not bool(np.all(np.isfinite(native_range)) and np.all(np.isfinite(high64 - low64))):
         raise ToolsetError("action-space range (high - low) overflows; bounds are too large")
     if not absolute and (bool(np.any(low64 > 0)) or bool(np.any(high64 < 0))):
-        raise ToolsetError("displacement control bounds must contain zero in every dimension")
+        kind = "velocity" if mode in _DRIVE_MODES else "displacement"
+        raise ToolsetError(f"{kind} control bounds must contain zero in every dimension")
     # DeltaLimitApprover derives undeclared dimensions in the box's native
     # dtype; reproduce that arithmetic exactly before substituting declarations.
     native_backstop = np.asarray(_BACKSTOP_STEP_FRAC * (high - low), dtype=np.float64)
@@ -706,4 +758,5 @@ def build_toolset(
         images=images,
         cameras=tuple(camera.name for camera in observation_space.cameras),
         pre_check=pre_check,
+        drive=mode in _DRIVE_MODES,
     )

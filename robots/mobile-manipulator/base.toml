@@ -1,0 +1,74 @@
+# The example mobile manipulator's differential-drive base under velocity control, with a
+# gamepad (docs/PRESETS.md). In the built-in simulator, with no hardware:
+#
+#   uv run abstract robot run --config rigs/mobile-base-teleop.toml "drive to the door"
+#
+# Hold LB and push the left stick to drive, the right stick to turn; Start ends the episode.
+
+[robot]
+name = "mobile-base"
+model = "mobile_manipulator.urdf"
+policy_hz = 50
+control_hz = 200
+mode = "base_vel"
+driver = "sim"
+# Discrete commands a policy can react to (observation.extra["command_events"]).
+command_events = ["go", "stop"]
+
+[robot.base]
+# The action: forward speed (m/s) and yaw rate (rad/s), in the base frame.
+command = ["vx", "yaw_rate"]
+limits = { vx = [-0.5, 1.0], yaw_rate = [-1.5, 1.5] }
+# An acceleration limit (per second): no jump from full speed to full reverse.
+max_accel = { vx = 1.0, yaw_rate = 3.0 }
+# Without a step for this long, the base stops.
+command_timeout_s = 0.25
+# Past this tilt the base stops and the episode ends (fall_detected).
+max_tilt_deg = 30
+
+[[robot.sensors]]
+name = "imu"
+frame = "imu_link"
+kind = "imu"
+
+[robot.state]
+fields = ["base_lin_vel", "base_ang_vel", "projected_gravity", "base_pose"]
+
+# The live commands a policy reads (observation.extra["commands"]); the teleop policy maps
+# them onto the action dimensions of the same name.
+[[robot.commands]]
+name = "vx"
+low = -0.5
+high = 1.0
+description = "forward speed, m/s"
+
+[[robot.commands]]
+name = "yaw_rate"
+low = -1.5
+high = 1.5
+description = "turn rate, rad/s, positive to the left"
+
+[[robot.controllers]]
+name = "pad"
+kind = "joystick"
+device = "/dev/input/js0"
+layout = "xbox"
+# Sticks count only while LB is held.
+deadman = "lb"
+
+[robot.controllers.axes]
+# Linux reports stick-up as negative, hence the negative scales.
+vx = { axis = "ly", scale = -1.0 }
+yaw_rate = { axis = "rx", scale = -1.5 }
+
+[robot.controllers.buttons]
+a = "go"
+b = "stop"
+start = "end_episode"
+
+# Any other program can send commands as JSON datagrams on loopback, e.g.
+# {"values": {"vx": 0.3}, "events": ["go"]}:
+# [[robot.controllers]]
+# name = "bridge"
+# kind = "udp"
+# port = 9870
