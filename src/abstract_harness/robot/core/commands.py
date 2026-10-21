@@ -56,11 +56,13 @@ from abstract_harness.robot.core.types import OPERATOR_END
 
 if TYPE_CHECKING:
     from abstract_harness.robot.core.approver import Approver
+    from abstract_harness.robot.core.command_stream import CommandSource, CommandStream
     from abstract_harness.robot.core.embodiment import Embodiment
     from abstract_harness.robot.core.log import EvalLog
     from abstract_harness.robot.core.logging.sink import LogSink
     from abstract_harness.robot.core.spaces import Box
     from abstract_harness.robot.core.task import Task
+    from abstract_harness.robot.core.timing import StrictTiming
 
 
 def _styled(text: str, code: str) -> str:
@@ -1379,11 +1381,10 @@ def _build_and_announce_guardrails(
     return approver
 
 
-def _announce_live_view(
-    policy_name: str, log_dir: str, env: Mapping[str, str] = os.environ
-) -> None:
-    """Print the copyable browser-view command for agent runs."""
-    if policy_name != "agent":
+def _announce_live_view(policy: Any, log_dir: str, env: Mapping[str, str] = os.environ) -> None:
+    """Print the copyable browser-view command for a policy that streams a transcript
+    (the agent, the orchestrator)."""
+    if not callable(getattr(policy, "transcript_delta", None)):
         return
     quoted = shlex.quote(log_dir)
     headless = _headless_session(env)
@@ -1409,6 +1410,77 @@ def _announce_live_view(
     )
 
 
+def _announce_timing(
+    policy: Any,
+    embodiment: Embodiment,
+    strict_timing: bool | StrictTiming,
+    async_inference: bool,
+) -> None:
+    """Say how the loop is paced, so an unpaced physical run is never a surprise."""
+    from abstract_harness.robot.core.embodiment import SELF_PACED
+    from abstract_harness.robot.core.errors import ConfigError
+    from abstract_harness.robot.core.timing import trial_timing
+
+    try:
+        timing, hz, auto = trial_timing(policy, embodiment, strict_timing)
+    except ConfigError:
+        return  # eval refuses the run with the same message
+    controller = " with async inference" if async_inference else ""
+    if timing is not None:
+        why = " (the policy needs a paced loop)" if auto else ""
+        print(f"timing: strict, {hz:g} Hz{why}{controller}")
+    elif SELF_PACED in embodiment.info.capabilities:
+        # The usual case (YAM, presets) says nothing new unless something new is on.
+        if async_inference:
+            print(f"timing: the embodiment paces itself{controller}")
+    elif not embodiment.info.is_simulated:
+        print(
+            _styled(
+                "timing warning: this embodiment does not pace itself and strict timing is "
+                "off, so steps run as fast as actions arrive; pass --strict-timing",
+                _YELLOW,
+            ),
+            file=sys.stderr,
+        )
+    elif async_inference:
+        print(f"timing: unpaced{controller}")
+
+
+def _command_stream(
+    embodiment: Embodiment, sources: Sequence[str | CommandSource]
+) -> CommandStream | None:
+    """The run's live command stream: the embodiment's own (``command_stream()``), with
+    the extra sources attached, or a free-form stream when only sources are given."""
+    from abstract_harness.robot.core.command_stream import (
+        CommandStream,
+        FdCommandSource,
+        parse_source,
+    )
+    from abstract_harness.robot.core.errors import ConfigError
+
+    hook = getattr(embodiment, "command_stream", None)
+    stream = hook() if callable(hook) else None
+    if stream is not None and not isinstance(stream, CommandStream):
+        raise SystemExit(
+            f"embodiment {embodiment.info.name!r} command_stream() returned "
+            f"{type(stream).__name__}, expected CommandStream"
+        )
+    if not sources and stream is None:
+        return None
+    announce = stream is not None or any(not isinstance(s, FdCommandSource) for s in sources)
+    if stream is None:
+        stream = CommandStream()
+    for source in sources:
+        try:
+            stream.add_source(parse_source(source) if isinstance(source, str) else source)
+        except (ConfigError, OSError, ValueError) as exc:
+            stream.close()
+            raise SystemExit(f"command source {source!r}: {exc}") from exc
+    if announce:  # serve's command pipe alone is silent until a client uses it
+        print(f"{_styled('commands:', _CYAN)} {stream.describe()}")
+    return stream
+
+
 def run_task(
     task: Task,
     resolved: Components,
@@ -1419,9 +1491,20 @@ def run_task(
     rerun_save: bool = True,
     seed: int = 0,
     grade: bool = True,
+    strict_timing: bool | StrictTiming = False,
+    async_inference: bool = False,
+    command_sources: Sequence[str | CommandSource] = (),
 ) -> int:
     """Run ``task`` on the constructed components and return the exit code: 0 when the
     run succeeds, 1 when it does not, 130 on Ctrl-C.
+
+    ``strict_timing`` holds each trial to the embodiment's control rate (``eval()``'s
+    contract); ``async_inference`` drives the policy with ``AsyncController``, so slow
+    inference overlaps execution instead of pausing the robot.
+    ``command_sources`` (``udp:HOST:PORT`` strings or ``CommandSource`` objects) feed a
+    live command stream into the policy, joining the stream the embodiment offers through
+    its optional ``command_stream()`` hook (a robot preset's controllers). The run owns
+    that stream and closes it with the embodiment.
 
     With ``prompt`` and a terminal on stdin the run is attended: the operator console
     takes messages and Esc, and, with ``grade``, the operator grader asks for the
@@ -1435,11 +1518,19 @@ def run_task(
     embodiment = resolved.embodiment
     live_sink: LiveLogSink | None = None
     rerun_sink: LogSink | None = None
+    stream: CommandStream | None = None
     try:
         print(f"policy: {resolved.policy_name} ({resolved.policy_source})")
         print(f"embodiment: {resolved.embodiment_name} ({resolved.embodiment_source})")
         approver = _build_and_announce_guardrails(embodiment.info.action_space, embodiment)
-        _announce_live_view(resolved.policy_name, log_dir)
+        controller = None
+        if async_inference:
+            from abstract_harness.robot.core.controller import AsyncController
+
+            controller = AsyncController()
+        _announce_timing(resolved.policy, embodiment, strict_timing, async_inference)
+        stream = _command_stream(embodiment, command_sources)
+        _announce_live_view(resolved.policy, log_dir)
 
         operator_input = None
         operator_session = None
@@ -1479,6 +1570,9 @@ def run_task(
                 store_frames=store_frames,
                 operator_input=operator_input,
                 grader=grader,
+                strict_timing=strict_timing,
+                controller=controller,
+                commands=stream,
             )
         except KeyboardInterrupt:
             if sink.path is not None and sink.path.exists():
@@ -1497,6 +1591,8 @@ def run_task(
                     live_sink.path.unlink(missing_ok=True)
         finally:
             try:
+                if stream is not None:
+                    stream.close()
                 embodiment.close()
             finally:
                 resolved.claim.release()
@@ -1525,6 +1621,9 @@ def doctor(embodiment: str, embodiment_args: Mapping[str, Any], source: str) -> 
         print(f"  [error] runtime-requirement: {module} missing → {remedy}")
     built = _resolve_or_exit("embodiment", embodiment, **embodiment_args)
     try:
+        notes = getattr(built, "doctor_notes", None)
+        if callable(notes):
+            print(notes())
         report = check_embodiment(built.info)
     finally:
         built.close()

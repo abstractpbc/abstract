@@ -8,6 +8,7 @@ passes everything through; clamping/operator approval land in rollout hardening.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, get_args, runtime_checkable
 
@@ -15,8 +16,38 @@ import numpy as np
 import numpy.typing as npt
 
 from abstract_harness.robot.core.errors import SafetyAbort
-from abstract_harness.robot.core.spaces import ABSOLUTE_CONTROL_MODES, Box, RotationRepr
+from abstract_harness.robot.core.spaces import (
+    ABSOLUTE_CONTROL_MODES,
+    RATE_CONTROL_MODES,
+    Box,
+    RotationRepr,
+)
 from abstract_harness.robot.core.types import Action
+
+#: The ``meta`` flags the built-in approvers set on an action they changed.
+APPROVER_FLAGS = ("clamped", "delta_clamped", "accel_clamped")
+#: ``DeltaLimitApprover``'s default per-step limit, as a fraction of a dimension's range.
+DEFAULT_STEP_FRACTION = 0.05
+
+
+def default_step_limits(space: Box) -> npt.NDArray[np.float64]:
+    """The per-step limit ``DeltaLimitApprover`` enforces by default: each dimension's
+    declared ``max_step``, else ``DEFAULT_STEP_FRACTION`` of its range (``inf`` without
+    bounds)."""
+    declared = (space.semantics.max_step if space.semantics else None) or (None,) * space.dim
+    if space.low is not None and space.high is not None:
+        span = np.asarray(space.high, np.float64).reshape(-1) - np.asarray(
+            space.low, np.float64
+        ).reshape(-1)
+    else:
+        span = np.full(space.dim, np.inf)
+    return np.array(
+        [
+            DEFAULT_STEP_FRACTION * span[i] if step is None else step
+            for i, step in enumerate(declared)
+        ],
+        dtype=np.float64,
+    )
 
 
 @runtime_checkable
@@ -217,7 +248,7 @@ class DeltaLimitApprover:
                     low_undeclared = low.reshape(-1)[undeclared]
                     high_undeclared = high.reshape(-1)[undeclared]
                     with np.errstate(over="ignore", invalid="ignore"):
-                        native_default = 0.05 * (high_undeclared - low_undeclared)
+                        native_default = DEFAULT_STEP_FRACTION * (high_undeclared - low_undeclared)
                     if not bool(
                         np.all(np.isfinite(low_undeclared))
                         and np.all(np.isfinite(high_undeclared))
@@ -281,6 +312,61 @@ class DeltaLimitApprover:
         if np.array_equal(approved, data):
             return action
         return replace(action, data=approved, meta={**dict(action.meta), "delta_clamped": True})
+
+
+class AccelerationLimitApprover:
+    """Limit how fast a rate command changes: the acceleration limit for velocity modes.
+
+    For ``joint_vel`` and ``base_vel`` spaces, the bounds clamp and the delta limit cap
+    the commanded *velocity*; this caps its change per control step, so a policy (or an
+    operator's stick) cannot jump a walking base from full speed to full reverse in one
+    step. Each dimension moves at most ``max_change`` (native units per step; derive it
+    as acceleration / control rate) from the last approved command, starting from rest
+    (zeros) at every trial. A decelerating command is limited too, so stopping ramps; the
+    embodiment's own watchdog or stop path is what halts at once. A modified action is
+    flagged ``meta["accel_clamped"]``; ``NaN`` raises ``SafetyAbort``. ``rest``, when
+    given, is asked before each review whether the robot was brought to rest outside
+    the policy's control (an embodiment's watchdog); if so, the limit ramps from zero
+    again rather than from the last approved command.
+    """
+
+    def __init__(
+        self,
+        action_space: Box,
+        max_change: float | Any,
+        *,
+        rest: Callable[[], bool] | None = None,
+    ):
+        sem = action_space.semantics
+        if sem is None or sem.control_mode not in RATE_CONTROL_MODES:
+            raise ValueError(
+                "AccelerationLimitApprover applies to rate control modes "
+                f"({sorted(RATE_CONTROL_MODES)}) only"
+            )
+        self._max = _validate_max_delta(max_change, action_space.shape, action_space.dim)
+        self._key = f"accel_limit:{id(self)}"
+        self._rest = rest
+
+    def begin_trial(self, reference: Any, store: dict[str, Any]) -> None:
+        """Every trial starts from rest, whatever the measured reference."""
+        store[self._key] = np.zeros_like(self._max)
+
+    def review(self, action: Action, store: dict[str, Any]) -> Action:
+        """Clamp the change from the previous approved command."""
+        data = np.asarray(action.data, dtype=np.float64)
+        if bool(np.isnan(data).any()):
+            raise SafetyAbort("AccelerationLimitApprover: action contains NaN")
+        rested = self._rest is not None and self._rest()  # asked every step: it resets
+        previous = store.get(self._key)
+        if previous is None or rested:
+            previous = np.zeros_like(self._max)
+        approved = np.clip(data, previous - self._max, previous + self._max)
+        store[self._key] = approved  # a new array: np.clip copies
+        if np.array_equal(approved, data):
+            return action
+        return replace(
+            action, data=approved.copy(), meta={**dict(action.meta), "accel_clamped": True}
+        )
 
 
 def _validate_max_delta(

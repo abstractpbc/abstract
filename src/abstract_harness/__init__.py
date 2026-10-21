@@ -68,6 +68,18 @@ _CORE_EXPORTS = {
     "local_policy": "abstract_harness.robot.vla",
     "vla_policy": "abstract_harness.robot.vla",
     "world_model_policy": "abstract_harness.robot.vla",
+    "AccelerationLimitApprover": "abstract_harness.robot.core.approver",
+    "AsyncController": "abstract_harness.robot.core.controller",
+    "AxisSpec": "abstract_harness.robot.core.command_stream",
+    "CommandStream": "abstract_harness.robot.core.command_stream",
+    "StrictTiming": "abstract_harness.robot.core.timing",
+    "TeleopPolicy": "abstract_harness.robot.core.teleop",
+    "PresetEmbodiment": "abstract_harness.robot.preset",
+    "RobotDriver": "abstract_harness.robot.preset",
+    "load_preset": "abstract_harness.robot.preset",
+    "ExtensionAPI": "abstract_harness.robot.orchestrator",
+    "JobContext": "abstract_harness.robot.orchestrator",
+    "OrchestratorPolicy": "abstract_harness.robot.orchestrator",
 }
 
 if TYPE_CHECKING:
@@ -194,11 +206,23 @@ if TYPE_CHECKING:
     from abstract_harness.robot.core import (
         vlm_grader as vlm_grader,
     )
+    from abstract_harness.robot.core.approver import (
+        AccelerationLimitApprover as AccelerationLimitApprover,
+    )
+    from abstract_harness.robot.core.command_stream import (
+        AxisSpec as AxisSpec,
+    )
+    from abstract_harness.robot.core.command_stream import (
+        CommandStream as CommandStream,
+    )
     from abstract_harness.robot.core.conformance import (
         assert_embodiment_conformant as assert_embodiment_conformant,
     )
     from abstract_harness.robot.core.conformance import (
         check_embodiment as check_embodiment,
+    )
+    from abstract_harness.robot.core.controller import (
+        AsyncController as AsyncController,
     )
     from abstract_harness.robot.core.controller import (
         Controller as Controller,
@@ -226,6 +250,30 @@ if TYPE_CHECKING:
     )
     from abstract_harness.robot.core.spaces import (
         StateSpec as StateSpec,
+    )
+    from abstract_harness.robot.core.teleop import (
+        TeleopPolicy as TeleopPolicy,
+    )
+    from abstract_harness.robot.core.timing import (
+        StrictTiming as StrictTiming,
+    )
+    from abstract_harness.robot.orchestrator import (
+        ExtensionAPI as ExtensionAPI,
+    )
+    from abstract_harness.robot.orchestrator import (
+        JobContext as JobContext,
+    )
+    from abstract_harness.robot.orchestrator import (
+        OrchestratorPolicy as OrchestratorPolicy,
+    )
+    from abstract_harness.robot.preset import (
+        PresetEmbodiment as PresetEmbodiment,
+    )
+    from abstract_harness.robot.preset import (
+        RobotDriver as RobotDriver,
+    )
+    from abstract_harness.robot.preset import (
+        load_preset as load_preset,
     )
     from abstract_harness.robot.vla import (
         AbstractGatewayPolicy as AbstractGatewayPolicy,

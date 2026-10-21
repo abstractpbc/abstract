@@ -65,7 +65,7 @@ typing = ["mypy>=2.4,<3"]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src/abstract_harness/_security.py", "src/abstract_harness/_signals.py", "src/abstract_harness/robot/core/supervision.py", "src/abstract_harness/robot/core/safety.py", "src/abstract_harness/robot/vla.py"]
+files = ["src/abstract_harness/_security.py", "src/abstract_harness/_signals.py", "src/abstract_harness/robot/core/supervision.py", "src/abstract_harness/robot/core/safety.py", "src/abstract_harness/robot/vla.py", "src/abstract_harness/robot/core/timing.py", "src/abstract_harness/robot/core/command_stream.py", "src/abstract_harness/robot/core/controller.py", "src/abstract_harness/robot/core/teleop.py", "src/abstract_harness/robot/preset", "src/abstract_harness/robot/orchestrator"]
 follow_imports = "skip"
 check_untyped_defs = true
 warn_unused_ignores = true

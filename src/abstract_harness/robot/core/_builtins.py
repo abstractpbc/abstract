@@ -24,6 +24,7 @@ from abstract_harness.robot.core.scorer import (
     success_at_end,
 )
 from abstract_harness.robot.core.task import Task
+from abstract_harness.robot.core.teleop import TeleopPolicy
 from abstract_harness.robot.yam.policy import MolmoAct2Policy, gr00t_policy
 
 # Embodiments
@@ -33,6 +34,7 @@ embodiment("cubepick")(CubePickEmbodiment)
 policy("scripted")(ScriptedPolicy)
 policy("random")(RandomPolicy)
 policy("noop")(NoopPolicy)
+policy("teleop")(TeleopPolicy)
 policy("molmoact2")(MolmoAct2Policy)
 policy("gr00t")(gr00t_policy)
 

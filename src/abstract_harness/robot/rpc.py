@@ -774,6 +774,8 @@ class Controller:
         self.run: Run | None = None
         self.last_run: dict[str, Any] | None = None
         self._terminal: Terminal | None = None
+        # The write end of the running episode's live command pipe (``--commands-fd``).
+        self._commands_fd: int | None = None
         self._screen = Screen(self.events.emit)
         # The running episode's open dialogs (by their id here) and status line, as its
         # events report them.
@@ -908,6 +910,35 @@ class Controller:
         if message.startswith("/"):
             raise ValueError("console commands go through stop, not steer")
         self._type(message.encode() + b"\n")
+        return {"disposition": "sent"}
+
+    def cmd_command(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Live commands for the running policy, as a gamepad sends them: ``values`` (name
+        to number, e.g. ``{"vx": 0.3}``) and ``events`` (names, e.g. ``["go"]``). The run's
+        command stream clamps values to their declared ranges and returns them to rest
+        when they stop arriving; ``end_episode`` ends the episode."""
+        from abstract_harness.robot.core.command_stream import parse_message
+
+        values, events_ = parse_message(
+            {"values": command.get("values") or {}, "events": command.get("events") or []}
+        )
+        if not values and not events_:
+            raise ValueError("send values, events or both")
+        if len(values) + len(events_) > 64:
+            raise ValueError("at most 64 values and events per command")
+        line = json.dumps({"values": values, "events": events_}).encode() + b"\n"
+        if len(line) > select.PIPE_BUF:
+            # Larger writes may interleave or split; a command must arrive whole.
+            raise ValueError(f"command too long ({len(line)} bytes, at most {select.PIPE_BUF})")
+        with self._lock:
+            if self._commands_fd is None:
+                raise ValueError("no run is active")
+            try:
+                os.write(self._commands_fd, line)
+            except BlockingIOError:
+                raise ValueError("the run is not reading commands; this one was dropped") from None
+            except OSError:
+                raise ValueError("the run's command channel is closed") from None
         return {"disposition": "sent"}
 
     def cmd_stop(self, command: dict[str, Any]) -> None:
@@ -1066,22 +1097,48 @@ class Controller:
             with self.preview.released():
                 read_fd, write_fd = os.pipe()
                 try:
+                    command_read, command_write = os.pipe()
+                except OSError:
+                    os.close(read_fd)
+                    os.close(write_fd)
+                    raise
+                try:
                     reader = EventReader(read_fd, lambda event: self._run_event(run, event))
                     split = argv.index("--")
-                    argv = [*argv[:split], "--events-fd", str(write_fd), *argv[split:]]
+                    argv = [
+                        *argv[:split],
+                        "--events-fd",
+                        str(write_fd),
+                        "--commands-fd",
+                        str(command_read),
+                        *argv[split:],
+                    ]
                     with self._lock:
                         terminal = self._terminal = Terminal(
-                            argv, dict(os.environ), self._output, pass_fds=(write_fd,)
+                            argv,
+                            dict(os.environ),
+                            self._output,
+                            pass_fds=(write_fd, command_read),
                         )
                         run.pid = terminal.process.pid
+                        # Never block a client: a run that stops reading drops commands.
+                        os.set_blocking(command_write, False)
+                        self._commands_fd, command_write = command_write, -1
                 finally:
                     os.close(write_fd)  # the run holds the only write end: EOF when it exits
+                    os.close(command_read)  # the run holds the only read end
+                    if command_write != -1:
+                        os.close(command_write)
                 self.events.emit({"type": "run_start", **run.describe()})
                 end["exitCode"] = terminal.wait()
                 reader.wait(timeout=5)
         except Exception as exc:
             end["error"] = f"{type(exc).__name__}: {exc}"
         with self._lock:
+            if self._commands_fd is not None:
+                with suppress(OSError):
+                    os.close(self._commands_fd)
+                self._commands_fd = None
             self._terminal = None
             left, self._dialogs = list(self._dialogs.values()), {}
             self.status = ""

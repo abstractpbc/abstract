@@ -960,3 +960,20 @@ def test_yam_tools_say_when_the_robot_extra_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "_modules", missing("abstract_harness.robot.yam.oops"))
     with pytest.raises(ModuleNotFoundError):
         parser()
+
+
+def test_vla_and_agent_name_any_policy_with_files_relative_to_the_config(tmp_path):
+    (tmp_path / "mine.py").write_text("def make(**kwargs):\n    return kwargs\n")
+    path = tmp_path / "robot.toml"
+    path.write_text('[vla]\npolicy = "mine.py:make"\n[vla.args]\nspeed = 2\n' + RIG)
+    config = RobotConfig.load(path)
+    assert config.policy_name == f"{(tmp_path / 'mine.py').resolve()}:make"
+    # A policy other than the server clients runs in process unless server_url is set.
+    assert config.vla.endpoint is None and config.policy_args() == {"speed": 2}
+    path.write_text('[vla]\npolicy = "my_pkg.policies:make"\n' + RIG)
+    assert RobotConfig.load(path).policy_name == "my_pkg.policies:make"
+    with pytest.raises(ValidationError, match="server_url must be a plain"):
+        path.write_text('[vla]\npolicy = "mine"\nserver_url = "ftp://h"\n' + RIG)
+        RobotConfig.load(path)
+    agent = write_config(tmp_path, policy="my_llm_policy")
+    assert RobotConfig.load(agent).policy_name == "my_llm_policy"

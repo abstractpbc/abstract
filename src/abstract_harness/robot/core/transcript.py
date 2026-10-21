@@ -59,6 +59,11 @@ def operator_message_event(t: int, text: str, source: str = "console") -> Event:
     return Event(kind="operator_message", t=t, data={"text": text, "source": source})
 
 
+def command_event(t: int, name: str, source: str) -> Event:
+    """Record one discrete live command (a button press) delivered at step ``t``."""
+    return Event(kind="command", t=t, data={"name": name, "source": source})
+
+
 def operator_event(t: int, verdict: str, source: str = "prompt", note: str | None = None) -> Event:
     """Record the operator's verdict, optional note, and source after the rollout ends.
 

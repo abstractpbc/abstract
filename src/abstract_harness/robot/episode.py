@@ -47,6 +47,7 @@ SINGLE_PART = "robot"
 POSITION_AXIS = re.compile(r"(?:d|delta_)?[xyz]")
 CARTESIAN_MODES = frozenset({"eef_abs_pose", "eef_delta_pose", "eef_delta_pos"})
 DELTA_MODES = frozenset({"joint_delta", "eef_delta_pose", "eef_delta_pos"})
+RATE_MODES = frozenset({"joint_vel", "base_vel"})
 STEP = re.compile(r"\bstep (\d+)/\d+")
 TAG = re.compile(r"[a-z0-9][a-z0-9._:=+-]{0,63}")
 OVERRIDES = frozenset({"policy", "outcome"})
@@ -163,7 +164,7 @@ def _travel(
     """The farthest any of ``columns`` was commanded from where it started: the change from
     the first action for absolute targets, the running sum of per-step changes, the running
     sum of velocities times ``dt``. None for velocities without a control rate."""
-    if mode == "joint_vel" and dt is None:
+    if mode in RATE_MODES and dt is None:
         return None
     first, sums, farthest = rows[0][1], [0.0] * len(columns), 0.0
     for _, action in rows:
@@ -171,7 +172,7 @@ def _travel(
             if mode in DELTA_MODES:
                 sums[k] += action[i]
                 value = sums[k]
-            elif mode == "joint_vel":
+            elif mode in RATE_MODES:
                 sums[k] += action[i] * (dt or 0.0)
                 value = sums[k]
             else:

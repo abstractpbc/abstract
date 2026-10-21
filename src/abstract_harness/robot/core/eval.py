@@ -52,9 +52,11 @@ from abstract_harness.robot.core.rollout import TrialRecord, derive_seed, rollou
 from abstract_harness.robot.core.scene import Scene
 from abstract_harness.robot.core.scorer import Score, get_reducer, reduce_scores, value_to_float
 from abstract_harness.robot.core.task import Task
+from abstract_harness.robot.core.timing import StrictTiming, trial_timing
 from abstract_harness.robot.core.transcript import judgement_source
 
 if TYPE_CHECKING:
+    from abstract_harness.robot.core.command_stream import CommandStream
     from abstract_harness.robot.core.console import OperatorInput
     from abstract_harness.robot.core.logging.sink import LogSink
     from abstract_harness.robot.core.spaces import Box, ObservationSpace
@@ -202,6 +204,7 @@ def _write_action_log(
                     "state_time": step.observation.state_time,
                     "image_times": dict(step.observation.image_times),
                     "state": _state_row(step.observation.state),
+                    **({"commands": dict(step.commands)} if step.commands is not None else {}),
                 },
                 allow_nan=False,
             )
@@ -345,6 +348,8 @@ def eval(
     environment_revision: str | None = None,
     policy_checkpoint: str | None = None,
     policy_timeout_s: float = 120.0,
+    strict_timing: bool | StrictTiming = False,
+    commands: CommandStream | None = None,
 ) -> list[EvalLog]:
     """Run ``task`` with ``policy`` on ``embodiment``; return ``[EvalLog]``.
 
@@ -411,9 +416,23 @@ def eval(
     ``grader=None`` (the registry name ``"none"`` is CLI vocabulary, not an
     API value).
 
+    ``strict_timing`` (``True`` or a ``StrictTiming``) paces every trial at a fixed tick
+    rate, by default the embodiment's declared ``control_hz``: each approved action
+    waits for its tick, and each trial's timing report (overruns, missed ticks, worst
+    lateness, effective rate) lands in its metadata under ``"timing"``. A policy that
+    declares ``requires_paced_loop = True`` (the orchestrator, whose model thinks while
+    the loop keeps ticking) gets strict timing automatically on an embodiment that does
+    not pace itself. Off by default: the loop then runs as fast as actions arrive.
+
+    ``commands`` streams live inputs into the policy (``core/command_stream.py``): each
+    step's observation carries the stream's values and events, each step record keeps
+    the values, and the action log gains a ``commands`` column. ``eval()`` starts the
+    stream's sources; the caller owns and closes it.
+
     Raises ``CompatibilityError`` (fail fast, before any
     rollout) if the policy and embodiment are incompatible, and
-    ``ConfigError`` for an invalid epoch reducer.
+    ``ConfigError`` for an invalid epoch reducer or a strict-timing rate that cannot
+    be resolved.
     """
     if not isinstance(fail_on_error, bool) and not (
         isinstance(fail_on_error, (int, float))
@@ -456,6 +475,8 @@ def eval(
             environment_revision=environment_revision,
             policy_checkpoint=policy_checkpoint,
             policy_timeout_s=policy_timeout_s,
+            strict_timing=strict_timing,
+            commands=commands,
         )
     finally:
         # Close what we opened: a registry-resolved embodiment is released even
@@ -485,6 +506,8 @@ def _run_eval(
     environment_revision: str | None = None,
     policy_checkpoint: str | None = None,
     policy_timeout_s: float = 120.0,
+    strict_timing: bool | StrictTiming = False,
+    commands: CommandStream | None = None,
 ) -> list[EvalLog]:
     """The body of ``eval``, after resolution/ownership."""
     from abstract_harness.robot.core.logging.json_log import JsonLogSink
@@ -517,6 +540,10 @@ def _run_eval(
     policy_bind_task = getattr(policy, "bind_task", None)
     if callable(policy_bind_task):
         policy_bind_task(task_envelope)
+
+    timing, timing_hz, timing_auto = trial_timing(policy, embodiment, strict_timing)
+    if commands is not None:
+        commands.start()
 
     epoch_spec = task.epoch_spec
     scorers = task.scorers
@@ -651,6 +678,10 @@ def _run_eval(
                         frame_store=frame_store,
                         operator_input=operator_input,
                         policy_timeout_s=policy_timeout_s,
+                        pacer=timing.pacer(timing_hz, auto=timing_auto)
+                        if timing is not None
+                        else None,
+                        commands=commands,
                     )
                 except _CancelledTrial as exc:
                     status = "cancelled"
@@ -976,6 +1007,7 @@ def eval_set(
     before_scoring: Callable[[TrialRecord, Scene], None] | None = None,
     grader: Grader | str | None = None,
     retry_attempts: int = 0,
+    strict_timing: bool | StrictTiming = False,
 ) -> tuple[bool, list[EvalLog]]:
     """Run a set of tasks and return ``(success, logs)``.
 
@@ -1036,6 +1068,7 @@ def eval_set(
                     # would leave every eval_set log with no grader recorded.
                     grader=resolved_grader,
                     before_scoring=None if resolved_grader is not None else before_scoring,
+                    strict_timing=strict_timing,
                 )
             )
         except (SafetyAbort, EmbodimentFault):

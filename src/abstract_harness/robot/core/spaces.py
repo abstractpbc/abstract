@@ -28,6 +28,9 @@ ControlMode = Literal[
     "eef_delta_pose",
     "eef_abs_pose",
     "eef_delta_pos",
+    # A mobile base's commanded velocity, e.g. (vx, vy, yaw_rate) in m/s and rad/s in the
+    # base frame: what a legged or wheeled robot's locomotion controller takes.
+    "base_vel",
 ]
 RotationRepr = Literal[
     "none",
@@ -42,6 +45,9 @@ Frame = Literal["base", "world", "camera"]
 
 #: Control modes whose actions name absolute targets rather than per-step changes.
 ABSOLUTE_CONTROL_MODES = frozenset({"joint_pos", "eef_abs_pose"})
+#: Control modes whose actions are rates: zero means stop, and holding the last value
+#: keeps the robot moving.
+RATE_CONTROL_MODES = frozenset({"joint_vel", "base_vel"})
 
 
 @dataclass(frozen=True)
@@ -157,6 +163,12 @@ class Box:
             out *= n
         return out
 
+    @property
+    def labels(self) -> tuple[str, ...]:
+        """Each dimension's name: the declared ``dim_labels``, else its index."""
+        declared = self.semantics.dim_labels if self.semantics is not None else None
+        return declared or tuple(str(i) for i in range(self.dim))
+
 
 @dataclass(frozen=True)
 class CameraSpec:
@@ -179,6 +191,13 @@ CANONICAL_STATE_UNITS: dict[str, str] = {
     "eef_quat": "unit_quat",
     "gripper": "normalized",  # 0 (closed) .. 1 (open)
     "gripper_width": "m",
+    # Locomotion: the floating base, in its own frame unless the key says otherwise.
+    "base_lin_vel": "m/s",  # (vx, vy, vz)
+    "base_ang_vel": "rad/s",  # (wx, wy, wz), from the IMU gyro
+    "projected_gravity": "unit_vec",  # gravity in the base frame: (0, 0, -1) when upright
+    "base_quat": "unit_quat_wxyz",  # base orientation in the world (IMU)
+    "base_pose": "m,m,rad",  # planar odometry (x, y, yaw) in the world
+    "joint_effort": "N*m",
 }
 
 
@@ -207,11 +226,15 @@ class StateSpec:
 def reference_state_keys(state: StateSpec | None, dim: int, control_mode: str) -> list[str]:
     """The state fields that can be the proprioceptive reference for absolute targets of
     ``dim`` dims: every field of shape ``(dim,)``. When several match (a 14-D ``joint_pos``
-    next to a 14-D ``eef_state``), the one whose key starts with the control mode's family
-    (``eef`` for ``eef_*`` modes, else ``joint``) if that leaves exactly one. The reference
-    is usable when exactly one key is returned; the agent policy's toolset and the
-    conformance check both apply this rule."""
+    next to a 14-D ``eef_state``), the field named after the control mode itself
+    (``joint_pos`` for ``joint_pos`` next to ``joint_vel`` and ``joint_effort``), else the
+    one whose key starts with the control mode's family (``eef`` for ``eef_*`` modes,
+    else ``joint``) if that leaves exactly one. The reference is usable when exactly one
+    key is returned; the agent policy's toolset and the conformance check both apply
+    this rule."""
     matching = [f.key for f in state.fields if f.shape == (dim,)] if state is not None else []
+    if len(matching) > 1 and control_mode in matching:
+        return [control_mode]
     if len(matching) > 1:
         family = "eef" if control_mode.startswith("eef") else "joint"
         preferred = [key for key in matching if key.startswith(family)]

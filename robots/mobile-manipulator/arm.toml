@@ -1,0 +1,60 @@
+# The example mobile manipulator's arm and claw under joint-position control, read from its
+# URDF (docs/PRESETS.md). The built-in simulator runs it anywhere, with no hardware:
+#
+#   uv run abstract eval --instruction "wave" --policy teleop --no-prompt --strict-timing \
+#       --embodiment preset -E preset=robots/mobile-manipulator/arm.toml
+#
+# For your robot, copy this file, point model at your URDF or MJCF, and set driver to your
+# driver class (docs/PRESETS.md, "Drivers").
+
+[robot]
+name = "mobile-arm"
+model = "mobile_manipulator.urdf"
+# The policy steps at 30 Hz (strict timing enforces it); the driver servos at 250 Hz.
+policy_hz = 30
+control_hz = 250
+mode = "joint_pos"
+driver = "sim"
+description = "The arm is mounted on the front of the base; the head camera looks down at the workspace."
+
+[robot.joints]
+# The six arm joints and the claw, in this order. The wheels stay out of the action.
+select = ["arm_j*", "claw_joint"]
+# Narrower than the URDF's limits: keep the shoulder clear of the base.
+limits = { arm_j2 = [-1.5, 1.5] }
+# The largest change per step (rad, or m for the claw).
+max_step = { "arm_j*" = 0.03, claw_joint = 0.004 }
+home = { arm_j2 = 0.4, arm_j3 = -0.8, claw_joint = 0.04 }
+home_secs = 2.0
+
+[robot.parts]
+arm = ["arm_j*"]
+claw = ["claw_joint"]
+
+[[robot.end_effectors]]
+name = "claw"
+frame = "claw_base_link"
+offset = [0.06, 0.0, 0.0]
+joints = ["claw_joint"]
+kind = "gripper"
+description = "two-finger claw; claw_joint is the finger gap in metres, 0 closed, 0.04 open"
+
+[[robot.cameras]]
+name = "head_cam"
+frame = "head_camera_link"
+width = 64
+height = 48
+
+[[robot.cameras]]
+name = "wrist_cam"
+frame = "wrist_camera_link"
+width = 64
+height = 48
+
+[[robot.sensors]]
+name = "imu"
+frame = "imu_link"
+kind = "imu"
+
+[robot.state]
+fields = ["joint_pos", "joint_vel"]

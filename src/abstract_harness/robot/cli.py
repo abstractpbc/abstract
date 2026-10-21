@@ -173,10 +173,37 @@ def configure_parser(sub: Any) -> None:
         help="extra policy argument for this run (keys set by the robot config are refused)",
     )
     run.add_argument(
+        "--strict-timing",
+        action="store_true",
+        help="hold every step to the rig's control rate and record missed deadlines "
+        "(as [rig] strict_timing = true)",
+    )
+    run.add_argument(
+        "--async-inference",
+        action="store_true",
+        help="infer the next action chunk while the current one plays "
+        "(as [rig] async_inference = true)",
+    )
+    run.add_argument(
         "--tag",
         action="append",
         default=[],
         help="label the run in the store's catalog, e.g. --tag cloth --tag demo (repeatable)",
+    )
+    run.add_argument(
+        "--commands",
+        action="append",
+        default=[],
+        metavar="SOURCE",
+        help="stream live commands into the policy from SOURCE (udp:HOST:PORT; repeatable), "
+        "next to the controllers a robot preset declares",
+    )
+    run.add_argument(
+        "--commands-fd",
+        type=int,
+        metavar="FD",
+        help="also read live commands as JSON lines from this inherited pipe "
+        "(how abstract robot serve forwards its command RPC)",
     )
     run.add_argument(
         "--events-fd",
@@ -550,10 +577,17 @@ def policy_probe_result(out: dict[str, Any]) -> tuple[bool, str, str | None]:
     expected_dim = int(out.get("expected_dim", 14))
     if len(shape) != 2 or shape[0] < 1 or shape[1] != expected_dim:
         return False, f"unexpected action chunk shape {shape}", None
-    detail = (
-        f"{shape[0]}x{shape[1]} chunk in {out.get('latency_s')}s; first step moves at most "
-        f"{out.get('first_step_rad')} rad from the home pose (synthetic black frames)"
-    )
+    if out.get("control_mode"):
+        # Not joint targets: the first action's largest value, in the mode's own units.
+        detail = (
+            f"{shape[0]}x{shape[1]} chunk in {out.get('latency_s')}s; first {out['control_mode']} "
+            f"action at most {out.get('first_step_rad')} (synthetic black frames)"
+        )
+    else:
+        detail = (
+            f"{shape[0]}x{shape[1]} chunk in {out.get('latency_s')}s; first step moves at most "
+            f"{out.get('first_step_rad')} rad from the home pose (synthetic black frames)"
+        )
     warnings = list(out.get("compat_warnings") or [])
     if out.get("outside_bounds"):
         warnings.append(
@@ -776,7 +810,7 @@ def check(args: argparse.Namespace) -> int:
         report("doctor", code == 0, "\n".join(tail))
         if vla is not None:
             ok, detail, warning = vla_probe_result(stack.vla_probe(config))
-            report(f"vla:{vla.policy}", ok, f"{vla.server_url}: {detail}", warning)
+            report(f"vla:{vla.policy}", ok, f"{vla.endpoint or 'in process'}: {detail}", warning)
     if installed and agent is not None:
         report("rehearsal", *rehearse(config))
     if config.store is not None:
@@ -808,6 +842,13 @@ def run(args: argparse.Namespace) -> int:
 
 def _run(args: argparse.Namespace) -> int:
     config = RobotConfig.load(args.config)
+    timing = {
+        key: True
+        for key in ("strict_timing", "async_inference")
+        if getattr(args, key, False) and not getattr(config.rig, key)
+    }
+    if timing:
+        config = config.model_copy(update={"rig": config.rig.model_copy(update=timing)})
     agent, vla, rig = config.agent, config.vla, config.rig
     if agent is not None and not args.allow_paid:
         raise ValueError("robot run calls a paid model and moves real arms; pass --allow-paid")
@@ -850,11 +891,18 @@ def _run(args: argparse.Namespace) -> int:
         "embodiment_args": embodiment_overrides,
         "grade": not args.no_verdict,
     }
+    command_sources: list[Any] = list(getattr(args, "commands", None) or [])
+    if getattr(args, "commands_fd", None) is not None:
+        from abstract_harness.robot.core.command_stream import FdCommandSource
+
+        command_sources.append(FdCommandSource(args.commands_fd))
+    if command_sources:
+        episode_args["command_sources"] = command_sources
     if vla is not None:
         write_setup(config, log_dir / SETUP, None, policy_overrides, embodiment_overrides)
-        announce(f"{vla.policy} at {vla.server_url}")
+        announce(f"{vla.policy} at {vla.endpoint or 'in process'}")
         code = stack.episode(config, instruction, log_dir, **episode_args)
-        summary: dict[str, Any] = {"policy": vla.policy, "server_url": vla.server_url}
+        summary: dict[str, Any] = {"policy": vla.policy, "server_url": vla.endpoint}
         summary_file, failed = "run-summary.json", code
     else:
         assert agent is not None and key is not None  # exactly one policy; key checked

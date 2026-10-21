@@ -1,0 +1,79 @@
+<?xml version="1.0"?>
+<!-- A toy mobile manipulator for the preset examples: a differential-drive base, a
+     six-joint arm with a custom two-finger claw, a head camera, a wrist camera and an IMU.
+     Geometry is schematic (no meshes); only joints, limits and frames matter here. -->
+<robot name="mobile_manipulator">
+  <link name="base_link"/>
+  <link name="left_wheel_link"/>
+  <link name="right_wheel_link"/>
+  <link name="imu_link"/>
+  <link name="head_camera_link"/>
+  <link name="arm_base_link"/>
+  <link name="arm_link1"/>
+  <link name="arm_link2"/>
+  <link name="arm_link3"/>
+  <link name="arm_link4"/>
+  <link name="arm_link5"/>
+  <link name="arm_link6"/>
+  <link name="wrist_camera_link"/>
+  <link name="claw_base_link"/>
+  <link name="claw_finger_link"/>
+
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_link"/><child link="left_wheel_link"/>
+    <origin xyz="0 0.2 0.05"/><axis xyz="0 1 0"/>
+    <limit effort="20" velocity="12"/>
+  </joint>
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_link"/><child link="right_wheel_link"/>
+    <origin xyz="0 -0.2 0.05"/><axis xyz="0 1 0"/>
+    <limit effort="20" velocity="12"/>
+  </joint>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/><child link="imu_link"/>
+  </joint>
+  <joint name="head_camera_joint" type="fixed">
+    <parent link="base_link"/><child link="head_camera_link"/>
+    <origin xyz="0.1 0 0.9" rpy="0 0.5 0"/>
+  </joint>
+  <joint name="arm_mount_joint" type="fixed">
+    <parent link="base_link"/><child link="arm_base_link"/>
+    <origin xyz="0.15 0 0.4"/>
+  </joint>
+  <joint name="arm_j1" type="revolute">
+    <parent link="arm_base_link"/><child link="arm_link1"/>
+    <axis xyz="0 0 1"/><limit lower="-2.9" upper="2.9" effort="30" velocity="2.0"/>
+  </joint>
+  <joint name="arm_j2" type="revolute">
+    <parent link="arm_link1"/><child link="arm_link2"/>
+    <origin xyz="0 0 0.1"/><axis xyz="0 1 0"/><limit lower="-1.8" upper="1.8" effort="30" velocity="2.0"/>
+  </joint>
+  <joint name="arm_j3" type="revolute">
+    <parent link="arm_link2"/><child link="arm_link3"/>
+    <origin xyz="0 0 0.25"/><axis xyz="0 1 0"/><limit lower="-2.5" upper="2.5" effort="20" velocity="2.0"/>
+  </joint>
+  <joint name="arm_j4" type="revolute">
+    <parent link="arm_link3"/><child link="arm_link4"/>
+    <origin xyz="0 0 0.25"/><axis xyz="1 0 0"/><limit lower="-3.1" upper="3.1" effort="10" velocity="3.0"/>
+  </joint>
+  <joint name="arm_j5" type="revolute">
+    <parent link="arm_link4"/><child link="arm_link5"/>
+    <axis xyz="0 1 0"/><limit lower="-2.0" upper="2.0" effort="10" velocity="3.0"/>
+  </joint>
+  <joint name="arm_j6" type="revolute">
+    <parent link="arm_link5"/><child link="arm_link6"/>
+    <axis xyz="1 0 0"/><limit lower="-3.1" upper="3.1" effort="10" velocity="3.0"/>
+  </joint>
+  <joint name="wrist_camera_joint" type="fixed">
+    <parent link="arm_link6"/><child link="wrist_camera_link"/>
+    <origin xyz="0.05 0 0.04"/>
+  </joint>
+  <joint name="claw_mount_joint" type="fixed">
+    <parent link="arm_link6"/><child link="claw_base_link"/>
+    <origin xyz="0.08 0 0"/>
+  </joint>
+  <joint name="claw_joint" type="prismatic">
+    <parent link="claw_base_link"/><child link="claw_finger_link"/>
+    <axis xyz="0 1 0"/><limit lower="0.0" upper="0.04" effort="40" velocity="0.1"/>
+  </joint>
+</robot>

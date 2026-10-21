@@ -1,0 +1,19 @@
+# Drive the example mobile base (robots/mobile-manipulator/base.toml) with a gamepad, in
+# the built-in kinematic simulator: nothing physical moves.
+#
+#   uv run abstract robot check --config rigs/mobile-base-teleop.toml
+#   uv run abstract robot run --config rigs/mobile-base-teleop.toml "drive to the door"
+#
+# The teleop policy maps the preset's live commands (vx, yaw_rate) onto the action, so the
+# bounds clamp, the acceleration limit, the watchdog and fall detection all apply. For a
+# real base, copy the preset, set its driver, and keep someone at the hardware stop.
+
+[vla]
+policy = "teleop"
+
+[rig]
+name = "mobile-base-sim"
+preset = "../robots/mobile-manipulator/base.toml"
+# Hold every step to the preset's policy_hz (50 Hz) and record missed deadlines.
+strict_timing = true
+max_steps = 3000

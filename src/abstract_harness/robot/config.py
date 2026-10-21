@@ -46,6 +46,7 @@ AGENT_TIMEOUT_MARGIN_S = 10.0
 PROTECTED_VLA_ARGS = frozenset({"server_url"})
 
 EMBODIMENT = "yam_arms"
+PRESET = "preset"
 
 # Constructor arguments for a policy or embodiment, as TOML values. A list reaches the
 # component as one comma-separated string, the form of its -E/-P KEY=VALUE flags, which
@@ -112,7 +113,16 @@ class AgentPricing(Pricing):
     cache_write_per_million: Nonnegative | None = None
 
 
+# A registered policy name, or "module:attribute" / "file.py:attribute" (relative to the
+# config file) for an unregistered policy factory.
+PolicyName = Annotated[str, Field(min_length=1, max_length=300, pattern=r"^\S+$")]
+
+
 class AgentConfig(Record):
+    # A metered LLM policy: "agent" drives the robot through its motion tools;
+    # "orchestrator" runs extension tools (trained policies, skills) as background jobs
+    # and watches their events; any other policy that takes the agent's arguments.
+    policy: PolicyName = "agent"
     model: Annotated[str, Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9._:-]+$")]
     pricing: AgentPricing
     # OpenAI bills a request with more input tokens than this at long-context rates. The
@@ -171,11 +181,17 @@ class AgentConfig(Record):
         return {**self.args, **pinned}
 
 
+# The action-policy clients that always talk to a server (unless "policy" runs a local
+# `target`); any other [vla] policy gets server_url only when the config sets one.
+SERVER_CLIENTS = ("policy", "molmoact2", "gr00t")
+
+
 class ActionPolicyConfig(Record):
     """An action policy (VLA or World-Action Model) on a cloud `/v1` gateway, a local
-    `/v1` or `/act` server, or an in-process local model (`target` in `args`)."""
+    `/v1` or `/act` server, or an in-process local model (`target` in `args`), or any
+    other registered action policy, such as `teleop`."""
 
-    policy: Literal["policy", "molmoact2", "gr00t"] = "policy"
+    policy: PolicyName = "policy"
     server_url: str = "https://api.abstract.inc/v1"
     # The policy client's arguments other than server_url, e.g. model, target, or camera size.
     args: Args = Field(default_factory=dict)
@@ -187,11 +203,7 @@ class ActionPolicyConfig(Record):
         if PROTECTED_VLA_ARGS & set(self.args):
             raise ValueError("[vla.args] cannot set server_url; set it in [vla]")
         _check_args("vla.args", self.args)
-        if (
-            self.policy == "policy"
-            and "target" in self.args
-            and "server_url" not in self.model_fields_set
-        ):
+        if self.endpoint is None:
             return self
         url = urlparse(self.server_url)
         allowed_paths = ("", "/", "/v1", "/v1/") if self.policy == "policy" else ("", "/")
@@ -207,14 +219,19 @@ class ActionPolicyConfig(Record):
             raise ValueError("server_url must be a plain http(s) base URL, e.g. http://host:8202")
         return self
 
+    @property
+    def endpoint(self) -> str | None:
+        """The server the policy's actions come from, or None for one that runs here."""
+        explicit = "server_url" in self.model_fields_set
+        if self.policy not in SERVER_CLIENTS:
+            return self.server_url if explicit else None
+        if self.policy == "policy" and "target" in self.args and not explicit:
+            return None
+        return self.server_url
+
     def policy_args(self) -> dict[str, Scalar | list[Scalar]]:
-        if (
-            self.policy == "policy"
-            and "target" in self.args
-            and "server_url" not in self.model_fields_set
-        ):
-            return dict(self.args)
-        return {**self.args, "server_url": self.server_url}
+        endpoint = self.endpoint
+        return dict(self.args) if endpoint is None else {**self.args, "server_url": endpoint}
 
 
 VlaConfig = ActionPolicyConfig
@@ -305,14 +322,38 @@ class RigConfig(Record):
     name: Annotated[str, Field(pattern=ROBOT_NAME)] = Field(default_factory=default_rig_name)
     # Registered embodiment name (default "yam_arms"; e.g. "franka", "so100", "cubepick").
     type: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")] = EMBODIMENT
+    # A robot preset TOML (docs/PRESETS.md), relative to this file: the rig is then the
+    # "preset" embodiment, and [rig.embodiment] overrides its driver, pace or driver_args.
+    preset: Path | None = None
     # Embodiment constructor arguments: CAN channels, cameras, control mode, limits.
     embodiment: Args = Field(default_factory=dict)
     # Relative paths resolve against the directory of the TOML file.
     log_root: Path = Field(default_factory=default_log_root)
     max_steps: Annotated[int, Field(ge=1, le=6000)] = 1200
+    # Hold every step to the embodiment's control rate (its control_hz, a preset's
+    # policy_hz) and record missed deadlines; `robot run --strict-timing` turns it on.
+    strict_timing: StrictBool = False
+    # With strict_timing: halt (and park) after this many late steps in a row.
+    max_consecutive_overruns: Annotated[int, Field(ge=1, le=100_000)] | None = None
+    # Infer the next action chunk while the current one plays (AsyncController).
+    async_inference: StrictBool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def preset_type(cls, data: Any) -> Any:
+        if isinstance(data, Mapping) and data.get("preset") is not None:
+            if data.get("type", PRESET) != PRESET:
+                raise ValueError(f'[rig] preset needs type = "{PRESET}" (or no type)')
+            return {**data, "type": PRESET}
+        return data
 
     @model_validator(mode="after")
     def channels_explicit(self) -> Self:
+        if self.type == PRESET and "preset" in self.embodiment:
+            # Only [rig] preset resolves against this file; an embodiment argument would not.
+            raise ValueError("set the preset in [rig] preset, not [rig.embodiment]")
+        if self.type == PRESET and self.preset is None:
+            raise ValueError('[rig] type = "preset" needs [rig] preset = "<robot preset TOML>"')
         # Which CAN interface drives which arm depends on the rig's wiring, and yam_arms'
         # defaults (left can0, right can1) are only a guess; never rely on them.
         if self.type == EMBODIMENT and not {"left_channel", "right_channel"} <= set(
@@ -320,7 +361,17 @@ class RigConfig(Record):
         ):
             raise ValueError("[rig.embodiment] must set left_channel and right_channel")
         _check_args("rig.embodiment", self.embodiment)
+        if self.max_consecutive_overruns is not None and not self.strict_timing:
+            raise ValueError("[rig] max_consecutive_overruns needs strict_timing = true")
         return self
+
+    def timing(self) -> Any:
+        """The run's ``StrictTiming``, or ``False`` when strict timing is off."""
+        if not self.strict_timing:
+            return False
+        from abstract_harness.robot.core.timing import StrictTiming
+
+        return StrictTiming(max_consecutive_overruns=self.max_consecutive_overruns)
 
 
 class RobotConfig(Record):
@@ -356,7 +407,7 @@ class RobotConfig(Record):
 
     @property
     def policy_name(self) -> str:
-        return "agent" if self.agent is not None else self.vla.policy  # type: ignore[union-attr]
+        return self.agent.policy if self.agent is not None else self.vla.policy  # type: ignore[union-attr]
 
     def policy_args(self, base_url: str | None = None) -> dict[str, Scalar]:
         """The policy's constructor arguments; an agent's base_url is the meter's."""
@@ -365,20 +416,26 @@ class RobotConfig(Record):
         return component_args(self.vla.policy_args())  # type: ignore[union-attr]
 
     def embodiment_args(self) -> dict[str, Scalar]:
-        """yam_arms' constructor arguments."""
-        return component_args(self.rig.embodiment)
+        """The embodiment's constructor arguments (a preset rig's include its path)."""
+        args = component_args(self.rig.embodiment)
+        if self.rig.preset is not None:
+            args = {"preset": str(self.rig.preset), **args}
+        return args
 
     def setup(self, base_url: str | None = None) -> dict[str, Any]:
         """Every argument a run of this config gives its components."""
-        return redact(
-            {
-                "policy": self.policy_name,
-                "policy_args": self.policy_args(base_url),
-                "embodiment": self.rig.type,
-                "embodiment_args": self.embodiment_args(),
-                "max_steps": self.rig.max_steps,
-            }
-        )
+        setup: dict[str, Any] = {
+            "policy": self.policy_name,
+            "policy_args": self.policy_args(base_url),
+            "embodiment": self.rig.type,
+            "embodiment_args": self.embodiment_args(),
+            "max_steps": self.rig.max_steps,
+        }
+        # Recorded when on, so a run that uses neither keeps its setup unchanged.
+        for key in ("strict_timing", "async_inference"):
+            if getattr(self.rig, key):
+                setup[key] = True
+        return redact(setup)
 
     @classmethod
     def load(cls, path: Path) -> Self:
@@ -390,10 +447,28 @@ class RobotConfig(Record):
             value = value.expanduser()
             return value if value.is_absolute() else base / value
 
+        # A "file.py[:attribute]" reference, like log_root, is relative to this file.
+        from abstract_harness.robot.core.registry import rebase
+
         rig, store = loaded.rig, loaded.store
+        agent, vla = loaded.agent, loaded.vla
+        if vla is not None:
+            vla = vla.model_copy(update={"policy": rebase(vla.policy, base)})
+        if agent is not None:
+            update: dict[str, Any] = {"policy": rebase(agent.policy, base)}
+            extensions = agent.args.get("extensions")
+            if isinstance(extensions, str | list):
+                items = extensions.split(",") if isinstance(extensions, str) else extensions
+                entries = [rebase(entry, base) for entry in (str(item).strip() for item in items)]
+                update["args"] = {**agent.args, "extensions": ",".join(e for e in entries if e)}
+            agent = agent.model_copy(update=update)
+        loaded = loaded.model_copy(update={"agent": agent, "vla": vla})
+        rig_update: dict[str, Any] = {"log_root": absolute(rig.log_root)}
+        if rig.preset is not None:
+            rig_update["preset"] = absolute(rig.preset)
         return loaded.model_copy(
             update={
-                "rig": rig.model_copy(update={"log_root": absolute(rig.log_root)}),
+                "rig": rig.model_copy(update=rig_update),
                 "store": store and store.model_copy(update={"env_file": absolute(store.env_file)}),
             }
         )

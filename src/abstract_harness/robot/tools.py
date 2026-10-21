@@ -28,7 +28,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from abstract_harness.robot.config import RobotConfig
+from abstract_harness.robot.config import EMBODIMENT, RobotConfig
 
 COMMANDS = ("holdcheck", "health", "pose")
 # Top-level modules of the robot extra: without one of them the tools cannot load.
@@ -77,4 +77,6 @@ def main(args: argparse.Namespace, **seams: Any) -> int:
         config = RobotConfig.load(args.config)
     except (OSError, ValueError) as exc:
         parser.error(f"{args.config}: {exc}")
+    if config.rig.type != EMBODIMENT:
+        parser.error(f"{args.tool} is a YAM tool; {args.config} configures a {config.rig.type} rig")
     return _modules()[args.tool].run_command(parser, args, config.embodiment_args(), **seams)

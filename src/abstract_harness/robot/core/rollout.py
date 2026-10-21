@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from abstract_harness.robot.core.approver import Approver
+from abstract_harness.robot.core.approver import APPROVER_FLAGS, Approver
 from abstract_harness.robot.core.controller import _INFER_KEY, Controller
 from abstract_harness.robot.core.embodiment import Embodiment
 from abstract_harness.robot.core.errors import (
@@ -35,6 +35,7 @@ from abstract_harness.robot.core.supervision import InferenceSupervisor
 from abstract_harness.robot.core.transcript import (
     Event,
     approval_event,
+    command_event,
     error_event,
     inference_event,
     operator_event,
@@ -45,12 +46,25 @@ from abstract_harness.robot.core.transcript import (
 from abstract_harness.robot.core.types import OPERATOR_END, Action, Observation, StepResult
 
 if TYPE_CHECKING:
+    from abstract_harness.robot.core.command_stream import CommandStream
     from abstract_harness.robot.core.console import OperatorInput
     from abstract_harness.robot.core.logging.sink import LogSink
+    from abstract_harness.robot.core.timing import Pacer
 
 _TRANSCRIPT_BYTE_LIMIT = 2 * 1024 * 1024
 _APPROVALS_KEY = "_rollout_approvals"
 _OPERATOR_MSGS_KEY = "_rollout_operator_messages"
+_COMMAND_EVENTS_KEY = "_rollout_command_events"
+
+
+def _delivered_key(key: str) -> str:
+    return f"{key}_delivered"
+
+
+def _pending(store: dict[str, Any], key: str) -> tuple[list[dict[str, Any]], int]:
+    """The entries under ``key`` the policy has not been given yet, and where they end."""
+    entries = store.get(key, [])
+    return [dict(entry) for entry in entries[store.get(_delivered_key(key), 0) :]], len(entries)
 
 
 class _OperatorStopped(Exception):
@@ -86,6 +100,8 @@ class StepRecord:
     image_refs: Mapping[str, FrameRef] | None = None
     result_image_refs: Mapping[str, FrameRef] | None = None
     requested_action: Action | None = None
+    # The live command values the policy saw at this step (``None`` without a stream).
+    commands: Mapping[str, float] | None = None
 
 
 @dataclass
@@ -272,6 +288,8 @@ def rollout(
     frame_store: FrameStore | None = None,
     operator_input: OperatorInput | None = None,
     policy_timeout_s: float = 120.0,
+    pacer: Pacer | None = None,
+    commands: CommandStream | None = None,
 ) -> TrialRecord:
     """Run a single trial and return its record.
 
@@ -287,11 +305,20 @@ def rollout(
     raised from inside the trial carries the partial ``TrialRecord`` on
     ``exc.record`` for the orchestrator to preserve.
 
-    The loop applies no wall-clock pacing of its own: ``embodiment.step()`` is
-    called as fast as the policy/controller/approver can produce actions. An
-    embodiment that needs real-time cadence paces itself inside ``step()`` and
-    declares the ``"self_paced"`` capability to document that it does (see
-    ``Embodiment``).
+    Without ``pacer`` the loop applies no wall-clock pacing of its own:
+    ``embodiment.step()`` is called as fast as the policy/controller/approver can
+    produce actions. An embodiment that needs real-time cadence paces itself inside
+    ``step()`` and declares the ``"self_paced"`` capability to document that it does
+    (see ``Embodiment``). With a ``Pacer`` (strict timing, ``core/timing.py``) every
+    approved action waits for its tick before dispatch, and the trial's timing report
+    lands in ``record.metadata["timing"]``; a pacer's ``SafetyAbort`` halts like an
+    approver's.
+
+    With a ``CommandStream`` (``core/command_stream.py``) each step injects the live
+    command values as ``extra["commands"]`` and the button events since the previous
+    ``act()`` as ``extra["command_events"]``; events are recorded in the transcript and
+    values with each step. The reserved event ``end_episode`` ends the trial as the
+    console's Esc does.
     """
     if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
         raise ValueError(f"max_steps must be an integer >= 1, got {max_steps!r}")
@@ -309,7 +336,16 @@ def rollout(
 
     try:
         t = -1
+        # A controller that infers in the background says when an observation went out.
+        last_dispatch = getattr(controller, "last_dispatch", None)
+        if not callable(last_dispatch):
+            last_dispatch = None
         try:
+            prepare = getattr(controller, "prepare_trial", None)
+            if callable(prepare):
+                # A controller that infers in the background confirms first that no
+                # earlier act() still runs: reset() must never overlap it.
+                prepare(policy)
             policy.reset(scene)
             policy_reset_ok = True
         except RobotError as exc:
@@ -340,6 +376,9 @@ def rollout(
                 raise
             except Exception as exc:
                 raise _record_failure(record, SafetyAbort(str(exc)), -1) from exc
+
+        if commands is not None:
+            commands.begin_trial()
 
         if operator_input is not None:
             try:
@@ -376,16 +415,27 @@ def rollout(
                         {"t": t, "text": text, "source": source}
                     )
                     record.events.append(operator_message_event(t, text, source))
+            command_values: dict[str, float] | None = None
+            end_by_command = False
+            if commands is not None and commands.active:
+                snapshot = commands.snapshot()
+                command_values = snapshot.values
+                for event in snapshot.events:
+                    store.setdefault(_COMMAND_EVENTS_KEY, []).append(
+                        {"t": t, "name": event.name, "source": event.source}
+                    )
+                    record.events.append(command_event(t, event.name, event.source))
+                end_by_command = snapshot.end
 
             prev_inferences = len(store.get(_INFER_KEY, []))
-            all_approvals = store.get(_APPROVALS_KEY, [])
-            last_approvals_idx = store.get("_rollout_last_approvals_idx", 0)
-            tail_approvals = [dict(a) for a in all_approvals[last_approvals_idx:]]
-            all_operator_msgs = store.get(_OPERATOR_MSGS_KEY, [])
-            last_operator_msgs_idx = store.get("_rollout_last_operator_msgs_idx", 0)
-            tail_operator_msgs = [
-                dict(message) for message in all_operator_msgs[last_operator_msgs_idx:]
-            ]
+            # What the policy has not seen yet; delivered up to what each tail held, so
+            # entries appended while this step's inference runs reach the next act().
+            channels = [_APPROVALS_KEY]
+            if operator_input is not None:
+                channels.append(_OPERATOR_MSGS_KEY)
+            if commands is not None:
+                channels.append(_COMMAND_EVENTS_KEY)
+            pending = {key: _pending(store, key) for key in channels}
 
             if poll is not None and poll.end is not None:
                 record.terminated = True
@@ -403,10 +453,19 @@ def rollout(
                     )
                 break
 
+            if end_by_command:
+                # After the console's own end, so a verdict typed in the same step survives.
+                record.terminated = True
+                record.termination_reason = OPERATOR_END
+                break
+
             try:
-                policy_extra = {**obs.extra, "env_step": t, "approvals": tail_approvals}
+                policy_extra = {**obs.extra, "env_step": t, "approvals": pending[_APPROVALS_KEY][0]}
                 if operator_input is not None:
-                    policy_extra["operator_messages"] = tail_operator_msgs
+                    policy_extra["operator_messages"] = pending[_OPERATOR_MSGS_KEY][0]
+                if command_values is not None:
+                    policy_extra["commands"] = command_values
+                    policy_extra["command_events"] = pending[_COMMAND_EVENTS_KEY][0]
                 obs_with_extra = replace(
                     obs,
                     extra=policy_extra,
@@ -419,6 +478,10 @@ def rollout(
                     health = getattr(embodiment, "check_health", None)
                     if callable(health):
                         health()
+                    if commands is not None and commands.end_requested():
+                        record.terminated = True
+                        record.termination_reason = OPERATOR_END
+                        raise _OperatorStopped
                     if operator_input is not None and console_enabled:
                         waiting = operator_input.poll()
                         for i, text in enumerate(waiting.messages):
@@ -463,10 +526,18 @@ def rollout(
                 raise _record_failure(record, _policy_error(policy, exc), t) from exc
 
             inferences = store.get(_INFER_KEY, [])
+            # What this step's observation carried reached the policy when an inference
+            # took it: at collection for synchronous controllers, at dispatch for a
+            # controller that reports it (AsyncController infers in the background).
+            delivered = (
+                last_dispatch(store) == t
+                if last_dispatch is not None
+                else len(inferences) > prev_inferences
+            )
+            if delivered:
+                for key, (_, end) in pending.items():
+                    store[_delivered_key(key)] = end
             if len(inferences) > prev_inferences:
-                store["_rollout_last_approvals_idx"] = len(all_approvals)
-                if operator_input is not None:
-                    store["_rollout_last_operator_msgs_idx"] = len(all_operator_msgs)
                 latency, chunk_len = inferences[-1]
                 record.events.append(inference_event(t, latency, chunk_len))
                 if stream_ok:
@@ -533,7 +604,7 @@ def rollout(
             except Exception as exc:
                 raise _record_failure(record, SafetyAbort(str(exc)), t) from exc
             if reviewed is not action:
-                flags = [k for k in ("clamped", "delta_clamped") if reviewed.meta.get(k)]
+                flags = [k for k in APPROVER_FLAGS if reviewed.meta.get(k)]
                 detail = ", ".join(flags) or None
                 record.events.append(approval_event(t, modified=True, detail=detail))
                 store.setdefault(_APPROVALS_KEY, []).append({"t": t, "detail": detail})
@@ -559,6 +630,12 @@ def rollout(
                 if refs
                 else obs_rec
             )
+            if pacer is not None:
+                try:
+                    pacer.wait()
+                except RobotError as exc:
+                    _record_failure(record, exc, t)
+                    raise
             try:
                 result: StepResult = embodiment.step(action)
             except RobotError as exc:
@@ -585,6 +662,7 @@ def rollout(
                     image_refs=refs,
                     result_image_refs=result_refs,
                     requested_action=requested_action,
+                    commands=command_values,
                 )
             )
             record.events.append(
@@ -623,10 +701,22 @@ def rollout(
         raise _CancelledTrial(record.error, record) from exc
     finally:
         _end_operator_trial(operator_input)
+        end_trial = getattr(controller, "end_trial", None)
+        if callable(end_trial) and not end_trial(store):
+            # An inference still runs on the controller's worker: the policy must not be
+            # read (transcript) or reset (the next trial) under it.
+            policy_reset_ok = False
+            record.metadata["policy_abandoned"] = True
         # Preserve measured latencies even when the trial ends in an error.
         record.inference_latencies = [
             lat for lat, _ in store.get(_INFER_KEY, []) if lat is not None
         ]
-        if policy_reset_ok:  # pragma: no branch - false only while an exception unwinds
+        if pacer is not None:
+            record.metadata["timing"] = pacer.report()
+        report = getattr(controller, "report", None)
+        controller_report = report(store) if callable(report) else None
+        if isinstance(controller_report, Mapping):
+            record.metadata["controller"] = dict(controller_report)
+        if policy_reset_ok:  # false while an exception unwinds or an inference was abandoned
             record.policy_transcript = _collect_transcript(policy)
     return record

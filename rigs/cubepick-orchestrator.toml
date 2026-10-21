@@ -1,0 +1,38 @@
+# An OpenAI model supervises the CubePick test world through the orchestrator: it runs the
+# example extension's tools (examples/extensions/cubepick_tools.py), a packaged policy
+# (reach_cube) and a skill (scan), as background jobs, and watches their events. No
+# hardware moves; the model is paid and metered like an [agent] run.
+#
+#   uv run abstract robot check --config rigs/cubepick-orchestrator.toml
+#   uv run abstract robot run --config rigs/cubepick-orchestrator.toml --allow-paid \
+#       "find the cube and reach it"
+#
+# The API key stays out of this file: OPENAI_API_KEY in ~/.config/abstract/openai.env.
+
+[agent]
+policy = "orchestrator"
+model = "gpt-6.1-sol"
+upstream = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+effort = "low"
+max_output_tokens = 2048
+max_calls = 20
+budget_usd = 0.50
+
+[agent.pricing]
+# Current USD per million tokens, from the provider's price list; never guessed.
+input_per_million = 2.00
+cached_input_per_million = 0.10
+output_per_million = 10.00
+cache_write_per_million = 2.50
+
+[agent.args]
+# Extension files are relative to this file; module names are imported as they are.
+extensions = "../examples/extensions/cubepick_tools.py"
+# Call the model with a status update after 10 s without one while jobs run.
+heartbeat_s = 10.0
+
+[rig]
+name = "cubepick-sim"
+type = "cubepick"
+max_steps = 600

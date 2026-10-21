@@ -47,6 +47,23 @@ def _configure_eval_parser(sub: argparse._SubParsersAction[argparse.ArgumentPars
     ev.add_argument("--no-prompt", action="store_true", help="skip interactive operator prompts")
     ev.add_argument("--store-frames", action="store_true", help="persist camera frames on disk")
     ev.add_argument("--rerun-save", action="store_true", help="write a Rerun .rrd recording")
+    ev.add_argument(
+        "--strict-timing",
+        action="store_true",
+        help="hold the loop to the embodiment's control rate and record missed deadlines",
+    )
+    ev.add_argument(
+        "--async-inference",
+        action="store_true",
+        help="infer the next chunk in the background while the current one plays",
+    )
+    ev.add_argument(
+        "--commands",
+        action="append",
+        default=[],
+        metavar="SOURCE",
+        help="stream live commands into the policy from SOURCE (udp:HOST:PORT; repeatable)",
+    )
     ev.add_argument("--seed", type=int, default=0)
     ev.add_argument("--max-steps", type=int, default=300)
     ev.add_argument("--scorer", default="success_at_end")
@@ -95,6 +112,9 @@ def _run_eval(args: argparse.Namespace) -> int:
         rerun_save=args.rerun_save,
         seed=args.seed,
         grade=not args.no_prompt,
+        strict_timing=args.strict_timing,
+        async_inference=args.async_inference,
+        command_sources=args.commands,
     )
 
 

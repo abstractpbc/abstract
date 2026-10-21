@@ -48,6 +48,28 @@ To construct a registered object, use `resolve("embodiment", "name", **arguments
 `abstract_harness.robot.core.registry`. Registration decorators do not construct instances.
 Factories must accept only documented arguments and must not log secret values.
 
+One rule names every component. A name is a registered name, or `"package.module:attribute"`
+or `"path/to/file.py:attribute"` for an unregistered factory. A file path in a TOML is
+relative to that TOML. The rule holds for these settings:
+
+- `--policy` and `--embodiment`;
+- a rig's `[vla]` and `[agent]` `policy`;
+- a robot preset's `driver` and controller `kind`;
+- the orchestrator's `extensions`.
+
+An installed package registers its components through an `abstract_harness.plugins` entry
+point that names a module. The harness imports the module at the first lookup. Its
+decorators then register what it provides: `@policy`, `@embodiment`, `@driver`,
+`@command_source`, `@extension` and the others in `registry.py`.
+
+```toml
+[project.entry-points."abstract_harness.plugins"]
+my_robot = "my_robot.plugin"
+```
+
+A plugin that fails to import is skipped with a warning. A plugin that replaces an
+existing name also prints a warning.
+
 Controllers select or transform predictions; approvers decide which targets may run.
 Use `DefaultController` for buffered action chunks, `SmoothingController` for low-pass
 filtering and `EnsemblingController` for compatible overlapping predictions. A stateful

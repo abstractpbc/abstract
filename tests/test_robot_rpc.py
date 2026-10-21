@@ -244,12 +244,13 @@ def test_episode_is_driven_like_the_console(controller):
     assert end["exitCode"] == 0 and end["summary"]["exit_code"] == 0 and end["events"]
     assert end["logDir"] == end["summary"]["log_dir"]
     assert end["upload"] == [{"upload": {"ok": True, "prefix": "yam-1/x/"}}]
-    # robot run itself, with no -E/-P; its events pipe, the tags as labels, the
-    # instruction after "--".
+    # robot run itself, with no -E/-P; its events and live-command pipes, the tags as
+    # labels, the instruction after "--".
     (argv,) = [json.loads(line) for line in controller.record.read_text().splitlines()]
-    fd = argv.index("--events-fd")
-    assert argv[fd + 1].isdigit()
-    del argv[fd : fd + 2]
+    for flag in ("--events-fd", "--commands-fd"):
+        fd = argv.index(flag)
+        assert argv[fd + 1].isdigit()
+        del argv[fd : fd + 2]
     assert argv == [
         "robot",
         "run",

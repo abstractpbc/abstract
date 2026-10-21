@@ -78,6 +78,7 @@ arrives as events.
 | `get_output` | `lines` (1 to 1000, default 200) | `{"lines": [...]}`: the last terminal lines of the current or last run | `lines` is out of range |
 | `prompt` | `message` (string, required), `tags` (list of strings), `streamingBehavior` | `{"disposition": "started", "run": "run-…"}` | see below |
 | `steer` | `message` | `{"disposition": "sent"}` | no run is active; the message starts with `/` |
+| `command` | `values` (name to number), `events` (names) | `{"disposition": "sent"}` | no run is active; a name or value is invalid; the run is not reading commands |
 | `stop` | `verdict` (`y`, `n` or `partial`, optional), `note` (≤ 500 chars, optional) | none | no run is active |
 | `abort` | none | none | no run is active |
 | `extension_ui_response` | `id`, plus `confirmed: true`, `cancelled: true` or `value` | none | no such pending dialog, or a wrong answer for its kind |
@@ -97,6 +98,14 @@ arrives as events.
 - **During a run:** a prompt with `"streamingBehavior": "steer"` is sent as `steer`.
 
 **steer** types one line to the policy, as the operator console does.
+
+**command** streams live commands into the running policy, as a gamepad would:
+`{"type": "command", "values": {"vx": 0.3, "yaw_rate": 0.0}, "events": ["go"]}`. Names
+match `[A-Za-z][A-Za-z0-9_.-]*`; at most 64 values and events per command. The run's
+command stream clamps values to their declared ranges and returns them to rest when they
+stop arriving, so a client streaming a velocity must keep sending it (for example at
+20 Hz). `end_episode` ends the episode. A run that stops reading drops commands instead
+of blocking the server. See [LIVE_CONTROL.md](LIVE_CONTROL.md).
 
 **stop** ends the episode from the console: `/stop`, or `/y`, `/n`, `/p` when a verdict is
 given (the note follows it). The arms park as at any episode end.
