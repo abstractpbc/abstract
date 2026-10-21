@@ -131,3 +131,64 @@ def test_model_errors(tmp_path: Path, text: str, message: str) -> None:
 def test_a_missing_model_file(tmp_path: Path) -> None:
     with pytest.raises(ModelError, match="cannot be read"):
         load_model(tmp_path / "absent.urdf")
+
+
+def test_mjcf_includes_keep_their_order_and_every_section_counts(tmp_path: Path) -> None:
+    (tmp_path / "a.xml").write_text(
+        '<mujoco><body name="a"><joint name="ja" range="-10 10"/></body></mujoco>'
+    )
+    (tmp_path / "b.xml").write_text(
+        '<mujoco><body name="b"><joint name="jb" range="-10 10"/></body></mujoco>'
+    )
+    (tmp_path / "robot.xml").write_text(
+        """
+        <mujoco>
+          <worldbody>
+            <include file="a.xml"/>
+            <include file="b.xml"/>
+            <frame name="mount">
+              <body name="c"><joint name="jc"/></body>
+            </frame>
+          </worldbody>
+          <worldbody><body name="d"><joint name="jd"/></body></worldbody>
+          <actuator><position joint="jb"/><position joint="ja"/></actuator>
+          <actuator><motor jointinparent="jd"/><motor joint="jc"/></actuator>
+        </mujoco>
+        """
+    )
+    model = load_model(tmp_path / "robot.xml")
+    assert [j.name for j in model.joints] == ["ja", "jb", "jc", "jd"]
+    assert [j.name for j in model.movable] == ["jb", "ja", "jd", "jc"]
+    assert {"a", "b", "c", "d", "mount"} <= model.frames
+    assert model.unresolved_actuators == ()
+
+
+def test_mjcf_actuators_that_drive_no_joint_are_reported(tmp_path: Path) -> None:
+    from abstract_harness.robot.preset import PresetError, load_preset
+
+    (tmp_path / "hand.xml").write_text(
+        """
+        <mujoco>
+          <worldbody>
+            <body name="palm"><joint name="wrist" range="-90 90"/><site name="tip"/></body>
+          </worldbody>
+          <tendon><fixed name="grip"><joint joint="wrist" coef="1"/></fixed></tendon>
+          <actuator>
+            <position joint="wrist"/>
+            <position name="squeeze" tendon="grip"/>
+            <general name="push" site="tip"/>
+          </actuator>
+        </mujoco>
+        """
+    )
+    model = load_model(tmp_path / "hand.xml")
+    assert model.unresolved_actuators == (
+        "squeeze (drives tendon 'grip')",
+        "push (drives site 'tip')",
+    )
+    preset = tmp_path / "hand.toml"
+    preset.write_text('[robot]\nname = "hand"\nmodel = "hand.xml"\npolicy_hz = 20\n')
+    with pytest.raises(PresetError, match="actuators that drive no joint"):
+        load_preset(preset)
+    preset.write_text(preset.read_text() + '[robot.joints]\nselect = ["wrist"]\n')
+    assert load_preset(preset).labels == ("wrist",)

@@ -428,3 +428,170 @@ def test_extension_files_resolve_against_the_robot_config(tmp_path: Path) -> Non
     assert RobotConfig.load(mixed).agent.args["extensions"] == (  # type: ignore[union-attr]
         f"my_pkg.tools,{tmp_path / 'local.py'}:setup"
     )
+
+
+def test_list_form_extensions_resolve_too(tmp_path: Path) -> None:
+    from abstract_harness.robot.config import RobotConfig
+
+    rig = Path(__file__).parents[2] / "rigs" / "cubepick-orchestrator.toml"
+    listed = tmp_path / "robot.toml"
+    listed.write_text(
+        rig.read_text().replace(
+            'extensions = "../examples/extensions/cubepick_tools.py"',
+            'extensions = ["tools.py", "my_pkg.tools"]',
+        )
+    )
+    agent = RobotConfig.load(listed).agent
+    assert agent is not None
+    assert agent.args["extensions"] == f"{tmp_path / 'tools.py'},my_pkg.tools"
+
+
+def _arm() -> Any:
+    from abstract_harness.robot.core.embodiment import joint_embodiment_info
+
+    return joint_embodiment_info("arm", low=[-2, -2], high=[2, 2], dim_labels=["a", "b"])
+
+
+def _drive_policy(policy: OrchestratorPolicy, ticks: int, until: Callable[[], bool]) -> list[Any]:
+    """Act like a robot whose approvers allow 0.01 per step toward each target."""
+    from abstract_harness.robot.core.types import Observation
+
+    state = np.zeros(2)
+    trace = []
+    for _ in range(ticks):
+        chunk = policy.act(Observation(state={"joint_pos": state.copy()}))
+        target = np.asarray(chunk.actions[0].data, float)
+        state = state + np.clip(target - state, -0.01, 0.01)
+        trace.append((target.copy(), state.copy()))
+        if until():
+            break
+        time.sleep(0.005)
+    return trace
+
+
+def test_a_stopped_job_holds_where_the_robot_is_not_at_its_last_target() -> None:
+    class Far:
+        def __init__(self, ctx: Any) -> None:
+            self.ctx = ctx
+
+        def step(self, observation: Any) -> list[float]:
+            return [1.5]  # far away: the approvers walk toward it 0.01 per step
+
+    api = ExtensionAPI()
+    api.register_tool(name="reach", description="reach far", start=Far, controls=["a"])
+    stopped = threading.Event()
+
+    def decide(history: str, n: int) -> Calls:
+        if n == 1:
+            return [("reach", {})]
+        if not stopped.is_set():
+            stopped.set()
+            return [("stop_job", {"job_id": "reach#1"})]
+        return [("wait", {})]
+
+    policy = orchestrator(FakeModel(decide), api=api, heartbeat_s=0.05)
+    policy.bind(_arm())
+    policy.reset(Scene(id="s", instruction="reach"))
+    trace = _drive_policy(
+        policy, 400, lambda: False if not stopped.is_set() else len(policy._jobs) == 0
+    )
+    for _ in range(20):
+        trace += _drive_policy(policy, 1, lambda: False)
+    policy._shutdown()
+    after = [target for target, _ in trace[-15:]]
+    # Once stopped, the target is the measured position, so the robot stops moving.
+    assert all(np.allclose(target, after[0]) for target in after)
+    assert after[0][0] < 1.0
+
+
+def test_a_slow_job_step_does_not_end_the_model_thread(tmp_path: Path) -> None:
+    class Slow:
+        def __init__(self, ctx: Any) -> None:
+            self.calls = 0
+
+        def step(self, observation: Any) -> None:
+            self.calls += 1
+            if self.calls == 2:
+                time.sleep(0.6)  # longer than idle_timeout_s: a cold-starting model
+
+    api = ExtensionAPI()
+    api.register_tool(name="warm_up", description="slow", start=Slow)
+
+    def decide(history: str, n: int) -> Calls:
+        return [("warm_up", {})] if n == 1 else [DONE]
+
+    model = FakeModel(decide)
+    policy = orchestrator(model, api=api, heartbeat_s=0.1, idle_timeout_s=0.2)
+    (log,) = eval(task(), policy, fast_cube(), log_dir=str(tmp_path))
+    assert log.samples[0].termination_reasons == ("done",)
+
+
+def test_policy_classes_are_built_and_steers_are_checked(tmp_path: Path) -> None:
+    from abstract_harness.robot.core.mock import ScriptedPolicy
+
+    api = ExtensionAPI()
+    api.register_policy_tool(name="reach", description="reach", policy=ScriptedPolicy)
+    api.register_tool(
+        name="scan",
+        description="scan",
+        start=lambda ctx, speed=0.01: type("S", (), {"step": lambda self, o: [0.0, 0.0]})(),
+        parameters={
+            "type": "object",
+            "properties": {"speed": {"type": "number"}},
+            "additionalProperties": False,
+        },
+    )
+
+    def decide(history: str, n: int) -> Calls:
+        if n == 1:
+            return [
+                ("scan", {}),
+                ("steer_job", {"job_id": "scan#1", "arguments": {"radius": 1}}),
+                (
+                    "move_by",
+                    {"deltas": {"dx": 0.1}, "targets": {"bogus": 1}, "note": "nudge right"},
+                ),
+            ]
+        return [DONE]
+
+    model = FakeModel(decide)
+    policy = orchestrator(model, api=api, heartbeat_s=0.05)
+    eval(task(), policy, fast_cube(), log_dir=str(tmp_path))
+    assert isinstance(policy._instances["reach"], ScriptedPolicy)
+    results = [m["content"] for m in model.requests[1]["messages"] if m.get("role") == "tool"]
+    assert results[0].startswith("started scan#1")
+    assert results[1].startswith("steer_job scan#1: unknown arguments ['radius']")
+    assert results[2].startswith("scan#1 already drives dx;")  # parsed, not a KeyError
+
+
+def test_a_finished_trial_ignores_its_old_model_thread() -> None:
+    policy = orchestrator(FakeModel(lambda h, n: [DONE]))
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s", instruction="x"))
+    from abstract_harness.robot.agent._llm import ToolCall
+
+    stale = policy._generation - 1
+    observation = CubePickEmbodiment().reset(Scene(id="s", instruction="x"))
+    call = ToolCall("c", "done", json.dumps({"summary": "s", "hindsight": "none"}))
+    assert policy._call(call, observation, stale) == ("ignored: the trial already ended", "end")
+    assert policy._finish is None
+
+
+def test_the_first_decision_has_a_deadline() -> None:
+    def slow(request: httpx.Request) -> httpx.Response:
+        time.sleep(1.0)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hmm"}}]})
+
+    policy = OrchestratorPolicy(
+        model="test/model",
+        base_url="http://llm.test/v1",
+        transport=httpx.MockTransport(slow),
+        env={},
+        first_turn_timeout_s=0.2,
+    )
+    cube = CubePickEmbodiment()
+    policy.bind(cube.info)
+    policy.reset(Scene(id="s", instruction="x"))
+    with pytest.raises(RuntimeError, match="no first decision in 0.2s"):
+        policy.act(cube.reset(Scene(id="s", instruction="x")))
+    policy._shutdown()

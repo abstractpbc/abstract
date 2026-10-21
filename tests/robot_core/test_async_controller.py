@@ -80,7 +80,9 @@ def test_executed_actions_always_match_their_step_under_latency() -> None:
     policy = StepPolicy(horizon=8, delay_s=0.03)
     actions, store = _drive(AsyncController(prefetch=4), policy, 40, tick_s=0.01)
     for t, action in enumerate(actions):
-        if not action.meta.get("hold"):
+        if action.meta.get("late"):
+            assert float(action.data[0]) < t  # an older prediction, played late
+        elif not action.meta.get("hold"):
             assert float(action.data[0]) == t
     report = store[_REPORT_KEY]
     assert report["inferences"] >= 4
@@ -105,8 +107,10 @@ def test_underrun_holds_the_last_absolute_target() -> None:
         action = controller.next_action(policy, _obs(3), 3, store)
         if not action.meta.get("hold") or time.monotonic() > deadline:
             break
-    assert float(action.data[0]) == 3  # chunk from step 1 lands with its stale actions dropped
-    assert store[_REPORT_KEY]["holds"] >= 1
+    # The chunk from step 1 predicted steps 1 and 2: all stale at step 3, so its newest
+    # action runs late rather than the robot holding until the next inference.
+    assert float(action.data[0]) == 2 and action.meta["late"] is True
+    assert store[_REPORT_KEY]["holds"] >= 1 and store[_REPORT_KEY]["late_actions"] == 1
 
 
 @pytest.mark.parametrize("mode", ["joint_delta", "eef_delta_pos", "joint_vel", "base_vel"])
@@ -221,3 +225,139 @@ def test_eval_runs_cubepick_with_async_inference_and_strict_timing(tmp_path: Any
     assert metadata["controller"]["controller"] == "async"
     assert metadata["timing"]["ticks"] >= 1
     assert log.results.metrics["success_at_end"] == 1.0
+
+
+def test_a_stop_on_a_stale_action_is_delivered() -> None:
+    class StopFirst(StepPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            chunk = super().act(observation)
+            if not self.calls[1:]:
+                return chunk  # the first chunk is ordinary
+            first = Action(data=chunk.actions[0].data, meta={"request_stop": True})
+            return ActionChunk(actions=[first, *chunk.actions[1:]])
+
+    policy = StopFirst(horizon=4, delay_s=0.03)
+    actions, _ = _drive(AsyncController(prefetch=3), policy, 30, tick_s=0.01)
+    assert any(a.meta.get("request_stop") for a in actions)
+
+
+def test_a_wholly_stale_stop_is_delivered() -> None:
+    class Done(StepPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            chunk = super().act(observation)
+            if len(self.calls) == 1:
+                return chunk
+            return ActionChunk(
+                actions=[Action(data=chunk.actions[0].data, meta={"request_stop": True})]
+            )
+
+    policy = Done(horizon=1, delay_s=0.03)
+    actions, _ = _drive(AsyncController(prefetch=0), policy, 20, tick_s=0.01)
+    assert any(a.meta.get("request_stop") for a in actions)
+
+
+def test_a_one_action_policy_keeps_moving_and_no_observation_is_sent_twice() -> None:
+    policy = StepPolicy(horizon=1, delay_s=0.025)
+    actions, store = _drive(AsyncController(prefetch=0), policy, 40, tick_s=0.01)
+    moving = [a for a in actions if not a.meta.get("hold")]
+    assert len(moving) > len(actions) / 4  # it acts on most inferences instead of holding
+    assert len(policy.calls) == len(set(policy.calls))  # every dispatched step is distinct
+
+
+def test_agent_like_policies_are_refused() -> None:
+    policy = StepPolicy()
+    policy.transcript_delta = lambda: None  # type: ignore[attr-defined]
+    with pytest.raises(ConfigError, match="transcript_delta"):
+        AsyncController().next_action(policy, _obs(0), 0, {})
+
+
+def test_end_trial_waits_for_inference_and_reports_a_stuck_one() -> None:
+    policy = StepPolicy(horizon=2)
+    controller = AsyncController(prefetch=0, join_timeout_s=0.1)
+    store: dict[str, Any] = {}
+    controller.next_action(policy, _obs(0), 0, store)
+    policy.gate = threading.Event()
+    controller.next_action(policy, _obs(1), 1, store)  # dispatches the next inference
+    assert controller.end_trial(store) is False
+    policy.gate.set()
+    assert controller.end_trial(store) is True
+
+
+def test_the_rollout_never_resets_a_policy_under_a_stuck_inference() -> None:
+    from abstract_harness.robot.core.approver import AutoApprover
+    from abstract_harness.robot.core.logging.sink import NullSink
+    from abstract_harness.robot.core.rollout import rollout
+
+    class Cube(CubePickEmbodiment):
+        pass
+
+    release = threading.Event()
+
+    class Hangs(ScriptedPolicy):
+        resets = 0
+
+        def reset(self, scene: Any) -> None:
+            Hangs.resets += 1
+            super().reset(scene)
+
+        def act(self, observation: Observation) -> ActionChunk:
+            if self.num_inferences >= 1:
+                release.wait(5)
+            return super().act(observation)
+
+    policy = Hangs(chunk_size=2)
+    record = rollout(
+        policy,
+        Cube(),
+        Scene(id="s", instruction="reach", init_seed=0),
+        max_steps=6,
+        seed=0,
+        epoch=0,
+        controller=AsyncController(prefetch=1, join_timeout_s=0.1),
+        approver=AutoApprover(),
+        sink=NullSink(),
+    )
+    assert record.metadata["policy_abandoned"] is True
+    assert record.policy_transcript is None
+    release.set()
+
+
+def test_events_reach_the_policy_once_under_async_inference() -> None:
+    from abstract_harness.robot.core.approver import AutoApprover
+    from abstract_harness.robot.core.command_stream import CommandStream
+    from abstract_harness.robot.core.logging.sink import NullSink
+    from abstract_harness.robot.core.rollout import rollout
+    from abstract_harness.robot.core.timing import Pacer
+
+    stream = CommandStream(events=["go"])
+    seen: list[int] = []
+
+    class Counting(ScriptedPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            seen.extend(event["t"] for event in observation.extra["command_events"])
+            time.sleep(0.03)
+            return super().act(observation)
+
+    class Pressing(CubePickEmbodiment):
+        def step(self, action: Any) -> Any:
+            stream.press("go", source="test")
+            return super().step(action)
+
+    cube = Pressing(max_step=0.001)
+    record = rollout(
+        Counting(chunk_size=8, max_step=0.001),
+        cube,
+        Scene(id="s", instruction="reach", init_seed=0),
+        max_steps=40,
+        seed=0,
+        epoch=0,
+        controller=AsyncController(prefetch=4),
+        approver=AutoApprover(),
+        sink=NullSink(),
+        pacer=Pacer(100),
+        commands=stream,
+    )
+    pressed = [e.t for e in record.events if e.kind == "command"]
+    # Every press is delivered exactly once, except those after the last dispatch.
+    assert seen == sorted(set(seen)) and set(seen) <= set(pressed)
+    assert len(seen) >= len(pressed) - 10

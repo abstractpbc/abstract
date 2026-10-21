@@ -15,9 +15,14 @@ what the driver must not decide alone:
 * **Pacing.** ``step()`` waits out the policy period (``pace = true``, the default), so
   steps never run faster than ``policy_hz`` whatever the policy does.
 * **Watchdog.** For rate modes (``base_vel``, ``joint_vel``), a step that does not arrive
-  within ``command_timeout_s`` stops the driver; motion resumes with the next step.
+  within ``command_timeout_s`` stops the driver; motion resumes with the next step, and
+  the acceleration limit ramps it up again from rest. A driver whose ``stop()`` fails
+  faults the episode.
 * **Fall detection.** Past ``max_tilt_deg`` from upright, the driver stops and the episode
-  ends (``fall_detected``).
+  ends (``fall_detected``); a reset refuses to start from a fallen robot.
+* **Position limits.** In ``joint_delta`` and ``joint_vel`` modes, whose action bounds
+  limit steps and velocities, a command that would carry a joint past the model's
+  position limits is cut to stop at the limit.
 
 Every action reaching the driver has passed the approver chain: the bounds clamp, the
 per-step limit, and for ``base_vel`` the acceleration limit from ``max_accel``.
@@ -48,7 +53,6 @@ from abstract_harness.robot.preset.description import RobotDescription, load_pre
 from abstract_harness.robot.preset.driver import load_driver_factory
 
 FALL = "fall_detected"
-_DEFAULT_RATE_TIMEOUT_S = 0.25
 
 
 def _flag(value: object, name: str) -> bool | None:
@@ -110,9 +114,12 @@ class PresetEmbodiment(EmbodimentBase):
         self._halted = False
         self.watchdog_stops = 0
         base = section.base
-        self._rate_timeout = base.command_timeout_s if base is not None else _DEFAULT_RATE_TIMEOUT_S
+        self._rate_timeout = self.description.command_timeout_s
         self._max_tilt = base.max_tilt_deg if base is not None else None
         self._home_confirmed = False
+        self._fault: str | None = None
+        self._rested = False
+        self._last_joint_pos: npt.NDArray[np.float64] | None = None
 
     # -- optional hooks ------------------------------------------------------------
 
@@ -136,9 +143,15 @@ class PresetEmbodiment(EmbodimentBase):
             else float(span[index]) or 1.0
             for index, label in enumerate(self.description.labels)
         ]
-        return GuardrailContribution(
-            approvers=(("accel-limit", AccelerationLimitApprover(action_space, per_step)),)
-        )
+        approver = AccelerationLimitApprover(action_space, per_step, rest=self._take_rest)
+        return GuardrailContribution(approvers=(("accel-limit", approver),))
+
+    def _take_rest(self) -> bool:
+        """Whether the driver was stopped outside the policy's control since the last
+        call (watchdog, fall): the acceleration limit then ramps from rest again."""
+        with self._lock:
+            rested, self._rested = self._rested, False
+        return rested
 
     def doctor_notes(self) -> str:
         """What the preset resolved to, for ``abstract robot check``."""
@@ -146,6 +159,8 @@ class PresetEmbodiment(EmbodimentBase):
 
     def check_health(self) -> None:
         """The driver's optional health check, run while inference is pending."""
+        if self._fault is not None:
+            raise EmbodimentFault(self._fault)
         driver = self._driver
         health = getattr(driver, "health", None) if driver is not None else None
         if callable(health):
@@ -171,7 +186,15 @@ class PresetEmbodiment(EmbodimentBase):
             ]
             if missing:
                 raise EmbodimentFault(f"driver {self.driver_spec!r} lacks {missing}")
-            driver.connect()
+            try:
+                driver.connect()
+            except BaseException:
+                # A half-opened driver must not leak its ports or SDK session.
+                try:
+                    driver.close()
+                except Exception:  # the connect failure is the one to report
+                    pass
+                raise
             self._driver = driver
         return self._driver
 
@@ -181,26 +204,41 @@ class PresetEmbodiment(EmbodimentBase):
         else:
             print(text, file=sys.stderr, flush=True)
 
+    def _require_attended(self) -> None:
+        if not self.simulated and not self._auto_start and self._session is None:
+            raise EmbodimentFault(
+                f"preset {self.description.name!r} drives a physical robot and needs an "
+                "attended run to confirm readiness (abstract robot run), or auto_start = "
+                "true with someone at the hardware stop"
+            )
+
     def _gate(self, prompt: str, notice: str) -> None:
         if self.simulated:
             return
         if self._auto_start:
             self._notice(f"auto_start: {notice}")
             return
-        if self._session is None:
-            raise EmbodimentFault(
-                f"preset {self.description.name!r} drives a physical robot and needs an "
-                "attended run to confirm readiness (abstract robot run), or auto_start = "
-                "true with someone at the hardware stop"
-            )
+        self._require_attended()
         self._session.gate(prompt, hint="Set auto_start = true in the preset to skip.")
 
     def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
         self._stop_watchdog()
+        # Refused before the driver connects: an unattended physical run opens nothing.
+        self._require_attended()
+        if self._fault is not None:
+            raise EmbodimentFault(self._fault)
         driver = self._ensure_driver()
         with self._lock:
             driver.stop()
             self._halted = False
+            self._rested = True
+        state = self._state(driver)
+        tilt = self._tilt(state)
+        if self._max_tilt is not None and tilt is not None and tilt > self._max_tilt:
+            raise EmbodimentFault(
+                f"the robot is tilted {tilt:.0f} degrees from upright (max_tilt_deg "
+                f"{self._max_tilt:g}): stand it up before starting an episode"
+            )
         home = self.description.home
         if home is not None and any(value is not None for value in home):
             if not self._home_confirmed:
@@ -225,6 +263,10 @@ class PresetEmbodiment(EmbodimentBase):
         return self._observe(driver, scene.instruction)
 
     def _ramp_home(self, driver: Any, home: tuple[float | None, ...]) -> None:
+        """Straight to the home pose from the measured one, every step within the per-step
+        limits. Waypoints are not clipped to the limits: a joint the operator left past a
+        narrowed limit walks back in at the step limit instead of jumping to the bound,
+        and a joint without a home value does not move."""
         measured = self._state(driver)["joint_pos"]
         target = np.array([measured[i] if value is None else value for i, value in enumerate(home)])
         description = self.description
@@ -247,18 +289,17 @@ class PresetEmbodiment(EmbodimentBase):
         period = 1.0 / description.policy_hz
         for fraction in np.linspace(1.0 / steps, 1.0, steps):
             with self._lock:
-                driver.command(
-                    np.clip(
-                        measured + (target - measured) * fraction, description.low, description.high
-                    )
-                )
+                driver.command(measured + (target - measured) * fraction)
             self._sleep(period)
 
     def step(self, action: Action) -> StepResult:
         driver = self._driver
         if driver is None:
             raise EmbodimentFault("step() before reset()")
+        if self._fault is not None:
+            raise EmbodimentFault(self._fault)
         data = np.asarray(action.data, dtype=np.float64).reshape(self.description.dim)
+        data, position_clamped = self._within_position_limits(data)
         if self._pacer is not None:
             self._pacer.wait()
         with self._lock:
@@ -272,15 +313,40 @@ class PresetEmbodiment(EmbodimentBase):
             with self._lock:
                 driver.stop()
                 self._halted = True
+                self._rested = True
         key = "joint_pos" if self.description.mode == "joint_pos" else self.description.mode
+        info: dict[str, Any] = {"tilt_deg": fallen} if fallen is not None else {}
+        if position_clamped:
+            info["position_clamped"] = True
         return StepResult(
             observation=observation,
             terminated=fallen is not None,
             termination_reason=FALL if fallen is not None else None,
-            info={"tilt_deg": fallen} if fallen is not None else {},
+            info=info,
             command={key: data.copy()},
             command_time=command_time,
         )
+
+    def _within_position_limits(
+        self, data: npt.NDArray[np.float64]
+    ) -> tuple[npt.NDArray[np.float64], bool]:
+        """For delta and velocity joint modes: shorten a command that would carry a joint
+        past the model's position limits so it stops at the limit. A command is only ever
+        shortened, never reversed or enlarged, so a joint already past a limit can move
+        back in but is never pushed."""
+        limits = self.description.position_limits
+        measured = self._last_joint_pos
+        if limits is None or measured is None:
+            return data, False
+        low, high = limits
+        dt = 1.0 if self.description.mode == "joint_delta" else 1.0 / self.description.policy_hz
+        with np.errstate(invalid="ignore"):
+            room_up = np.where(np.isnan(high), np.inf, np.maximum(high - measured, 0.0)) / dt
+            room_down = np.where(np.isnan(low), -np.inf, np.minimum(low - measured, 0.0)) / dt
+        limited = np.where(data > 0, np.minimum(data, room_up), np.maximum(data, room_down))
+        if np.array_equal(limited, data):
+            return data, False
+        return limited, True
 
     def close(self) -> None:
         self._stop_watchdog()
@@ -320,6 +386,8 @@ class PresetEmbodiment(EmbodimentBase):
     def _observe(self, driver: Any, instruction: str | None) -> Observation:
         state = self._state(driver)
         state_time = self._clock()
+        if "joint_pos" in state:
+            self._last_joint_pos = state["joint_pos"].copy()
         images: dict[str, Any] = {}
         image_times: dict[str, float] = {}
         if self.description.cameras:
@@ -350,19 +418,23 @@ class PresetEmbodiment(EmbodimentBase):
         """The base's tilt in degrees when it exceeds ``max_tilt_deg``, else ``None``."""
         if self._max_tilt is None:
             return None
-        gravity = observation.state.get("projected_gravity")
+        tilt = self._tilt(observation.state)
+        return tilt if tilt is not None and tilt > self._max_tilt else None
+
+    @staticmethod
+    def _tilt(state: Mapping[str, Any]) -> float | None:
+        """Degrees from upright, from projected gravity or the base quaternion."""
+        gravity = state.get("projected_gravity")
         if gravity is not None:
             norm = float(np.linalg.norm(gravity))
             if norm == 0:
                 return None
-            tilt = math.degrees(math.acos(max(-1.0, min(1.0, -float(gravity[2]) / norm))))
-        else:
-            quat = observation.state.get("base_quat")
-            if quat is None:
-                return None
-            _, x, y, _ = (float(v) for v in quat)
-            tilt = math.degrees(math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (x * x + y * y)))))
-        return tilt if tilt > self._max_tilt else None
+            return math.degrees(math.acos(max(-1.0, min(1.0, -float(gravity[2]) / norm))))
+        quat = state.get("base_quat")
+        if quat is None:
+            return None
+        _, x, y, _ = (float(v) for v in quat)
+        return math.degrees(math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (x * x + y * y)))))
 
     def _start_watchdog(self) -> None:
         self._watchdog_stop.clear()
@@ -386,6 +458,13 @@ class PresetEmbodiment(EmbodimentBase):
                     driver = self._driver
                     if driver is None or self._halted or self._last_command != last:
                         continue
-                    driver.stop()
+                    try:
+                        driver.stop()
+                    except Exception as exc:
+                        # Keep trying every interval; the next step or health check faults
+                        # the episode, so it cannot run on past a failed stop.
+                        self._fault = f"the watchdog could not stop the driver: {exc}"
+                        continue
                     self._halted = True
+                    self._rested = True
                     self.watchdog_stops += 1

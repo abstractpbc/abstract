@@ -577,10 +577,17 @@ def policy_probe_result(out: dict[str, Any]) -> tuple[bool, str, str | None]:
     expected_dim = int(out.get("expected_dim", 14))
     if len(shape) != 2 or shape[0] < 1 or shape[1] != expected_dim:
         return False, f"unexpected action chunk shape {shape}", None
-    detail = (
-        f"{shape[0]}x{shape[1]} chunk in {out.get('latency_s')}s; first step moves at most "
-        f"{out.get('first_step_rad')} rad from the home pose (synthetic black frames)"
-    )
+    if out.get("control_mode"):
+        # Not joint targets: the first action's largest value, in the mode's own units.
+        detail = (
+            f"{shape[0]}x{shape[1]} chunk in {out.get('latency_s')}s; first {out['control_mode']} "
+            f"action at most {out.get('first_step_rad')} (synthetic black frames)"
+        )
+    else:
+        detail = (
+            f"{shape[0]}x{shape[1]} chunk in {out.get('latency_s')}s; first step moves at most "
+            f"{out.get('first_step_rad')} rad from the home pose (synthetic black frames)"
+        )
     warnings = list(out.get("compat_warnings") or [])
     if out.get("outside_bounds"):
         warnings.append(

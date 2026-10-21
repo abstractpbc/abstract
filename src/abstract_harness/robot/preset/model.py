@@ -64,6 +64,9 @@ class RobotModel:
     actuated: tuple[str, ...] = ()
     digest: str = ""
     frame_kinds: dict[str, str] = field(default_factory=dict)
+    # MJCF actuators that drive no joint of the model (tendons, sites, bodies): a default
+    # selection by actuator order would silently miss them.
+    unresolved_actuators: tuple[str, ...] = ()
 
     def joint(self, name: str) -> ModelJoint | None:
         for joint in self.joints:
@@ -173,22 +176,27 @@ def _urdf(root: ET.Element, path: Path, digest: str) -> RobotModel:
 
 
 def _expand_includes(root: ET.Element, base: Path, depth: int = 0) -> None:
-    """Replace each ``<include file=...>`` with the included document's children. As in
-    MuJoCo, every include path is relative to the main model file's directory."""
+    """Replace each ``<include file=...>`` with the included document's children, in
+    place and in order. As in MuJoCo, every include path is relative to the main model
+    file's directory."""
     if depth > _MAX_INCLUDE_DEPTH:
         raise ModelError(f"{base}: <include> nested more than {_MAX_INCLUDE_DEPTH} deep")
     for parent in list(root.iter()):
-        for index, child in enumerate(list(parent)):
+        children = list(parent)
+        if not any(child.tag == "include" for child in children):
+            continue
+        expanded: list[ET.Element] = []
+        for child in children:
             if child.tag != "include":
+                expanded.append(child)
                 continue
             file = child.get("file")
             if not file:
                 raise ModelError(f"{base}: <include> needs a file")
             included = _parse(base / file)
             _expand_includes(included, base, depth + 1)
-            parent.remove(child)
-            for offset, grandchild in enumerate(list(included)):
-                parent.insert(index + offset, grandchild)
+            expanded.extend(list(included))
+        parent[:] = expanded
 
 
 def _mjcf_defaults(root: ET.Element) -> dict[str, dict[str, str]]:
@@ -217,74 +225,77 @@ def _mjcf(root: ET.Element, path: Path, digest: str) -> RobotModel:
     frames: dict[str, str] = {}
     seen: set[str] = set()
 
-    def visit(body: ET.Element, body_class: str, parent_body: str | None) -> None:
-        name = body.get("name")
-        if name:
-            frames[name] = "body"
-        child_class = body.get("childclass", body_class)
-        for site in body.findall("site"):
-            if site.get("name"):
-                frames[site.get("name") or ""] = "site"
-        for camera in body.findall("camera"):
-            if camera.get("name"):
-                frames[camera.get("name") or ""] = "camera"
-        for element in [*body.findall("joint"), *body.findall("freejoint")]:
-            joint_class = element.get("class", child_class)
-            attributes = {**defaults.get("main", {}), **defaults.get(joint_class, {})}
-            attributes.update(element.attrib)
-            kind = "free" if element.tag == "freejoint" else attributes.get("type", "hinge")
-            joint_name = element.get("name")
-            if not joint_name:
-                if kind == "free":
-                    continue  # an unnamed floating base: nothing a preset can address
-                raise ModelError(f"{path}: a <joint> in body {name!r} needs a name")
-            if joint_name in seen:
-                raise ModelError(f"{path}: joint {joint_name!r} is declared twice")
-            seen.add(joint_name)
-            what = f"{path}: joint {joint_name} range"
-            bounds = _floats(attributes.get("range"), 2, what)
-            limited = attributes.get("limited", "auto")
-            lower = upper = None
-            if bounds is not None and limited != "false":
-                lower, upper = bounds
-                if kind == "hinge" and degrees:
-                    lower, upper = math.radians(lower), math.radians(upper)
-            effort = None
-            force = _floats(attributes.get("actuatorfrcrange"), 2, f"{path}: {joint_name}")
-            if force is not None:
-                effort = max(abs(force[0]), abs(force[1]))
-            joints.append(
-                ModelJoint(
-                    name=joint_name,
-                    type=kind,
-                    lower=lower,
-                    upper=upper,
-                    effort=effort,
-                    parent=parent_body,
-                    child=name,
-                )
+    def joint(element: ET.Element, joint_class: str, body: str | None, parent: str | None) -> None:
+        attributes = {**defaults.get("main", {}), **defaults.get(joint_class, {})}
+        attributes.update(element.attrib)
+        kind = "free" if element.tag == "freejoint" else attributes.get("type", "hinge")
+        name = element.get("name")
+        if not name:
+            if kind == "free":
+                return  # an unnamed floating base: nothing a preset can address
+            raise ModelError(f"{path}: a <joint> in body {body!r} needs a name")
+        if name in seen:
+            raise ModelError(f"{path}: joint {name!r} is declared twice")
+        seen.add(name)
+        bounds = _floats(attributes.get("range"), 2, f"{path}: joint {name} range")
+        lower = upper = None
+        if bounds is not None and attributes.get("limited", "auto") != "false":
+            lower, upper = bounds
+            if kind == "hinge" and degrees:
+                lower, upper = math.radians(lower), math.radians(upper)
+        force = _floats(attributes.get("actuatorfrcrange"), 2, f"{path}: {name}")
+        effort = max(abs(force[0]), abs(force[1])) if force is not None else None
+        joints.append(
+            ModelJoint(
+                name=name, type=kind, lower=lower, upper=upper, effort=effort,
+                parent=parent, child=body,
             )
-        for child in body.findall("body"):
-            visit(child, child_class, name)
+        )  # fmt: skip
 
-    worldbody = root.find("worldbody")
-    if worldbody is None:
+    def contents(element: ET.Element, body: str | None, parent: str | None, cls: str) -> None:
+        """A body's (or frame's, or the world's) sites, cameras, joints and children."""
+        for child in element:
+            name = child.get("name")
+            if child.tag in ("site", "camera") and name:
+                frames[name] = child.tag
+            elif child.tag in ("joint", "freejoint"):
+                joint(child, child.get("class", cls), body, parent)
+            elif child.tag == "frame":
+                # A frame groups elements without a body of its own; MuJoCo >= 3.
+                if name:
+                    frames[name] = "frame"
+                contents(child, body, parent, child.get("childclass", cls))
+            elif child.tag == "body":
+                if name:
+                    frames[name] = "body"
+                contents(child, name, body, child.get("childclass", cls))
+
+    worldbodies = root.findall("worldbody")
+    if not worldbodies:
         raise ModelError(f"{path}: an MJCF model needs a <worldbody>")
-    for site in worldbody.findall("site"):
-        if site.get("name"):
-            frames[site.get("name") or ""] = "site"
-    for camera in worldbody.findall("camera"):
-        if camera.get("name"):
-            frames[camera.get("name") or ""] = "camera"
-    for body in worldbody.findall("body"):
-        visit(body, "main", None)
+    for worldbody in worldbodies:
+        contents(worldbody, None, None, "main")
     actuated: list[str] = []
-    actuator = root.find("actuator")
-    if actuator is not None:
-        for element in actuator:
-            joint_name = element.get("joint")
-            if joint_name and joint_name not in actuated:
-                actuated.append(joint_name)
+    unresolved: list[str] = []
+    for section in root.findall("actuator"):
+        for element in section:
+            target = element.get("joint") or element.get("jointinparent")
+            label = element.get("name") or element.tag
+            if target and target in seen:
+                if target not in actuated:
+                    actuated.append(target)
+            else:
+                via = next(
+                    (
+                        key
+                        for key in ("tendon", "site", "body", "joint", "jointinparent")
+                        if element.get(key)
+                    ),
+                    "nothing",
+                )
+                unresolved.append(
+                    f"{label} (drives {via} {element.get(via, '')!r})".replace(" ''", "")
+                )
     return RobotModel(
         name=root.get("model") or path.stem,
         format="mjcf",
@@ -294,4 +305,5 @@ def _mjcf(root: ET.Element, path: Path, digest: str) -> RobotModel:
         actuated=tuple(actuated),
         digest=digest,
         frame_kinds=frames,
+        unresolved_actuators=tuple(unresolved),
     )

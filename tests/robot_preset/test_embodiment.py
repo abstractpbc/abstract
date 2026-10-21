@@ -166,6 +166,7 @@ def physical_arm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     shutil.copy(ARM.parent / "mobile_manipulator.urdf", tmp_path)
     preset = ARM.read_text().replace('driver = "sim"', 'driver = "fake_robot_driver:FakeRobot"')
     (tmp_path / "arm.toml").write_text(preset)
+    FakeRobot.calls = []
     module = type(sys)("fake_robot_driver")
     module.FakeRobot = FakeRobot  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "fake_robot_driver", module)
@@ -191,7 +192,8 @@ def test_a_physical_driver_needs_an_attended_run(physical_arm: Path) -> None:
     with pytest.raises(EmbodimentFault, match="needs an attended run"):
         arm.reset(SCENE)
     arm.close()
-    assert FakeRobot.calls[-2:] == ["stop", "close"]
+    # Refused before the driver was even constructed: nothing was opened.
+    assert FakeRobot.calls == []
 
 
 def test_physical_gates_go_through_the_session(physical_arm: Path) -> None:
@@ -345,6 +347,10 @@ def test_rig_preset_paths_resolve_against_the_rig_file(tmp_path: Path) -> None:
         ('[rig]\ntype = "cubepick"\npreset = "x.toml"\n', 'needs type = "preset"'),
         ('[rig]\ntype = "preset"\n', "needs \\[rig\\] preset"),
         (
+            '[rig]\ntype = "preset"\n[rig.embodiment]\npreset = "y.toml"\n',
+            "not \\[rig.embodiment\\]",
+        ),
+        (
             '[rig]\npreset = "x.toml"\n[rig.embodiment]\npreset = "y.toml"\n',
             "not \\[rig.embodiment\\]",
         ),
@@ -400,3 +406,109 @@ def test_yam_tools_refuse_a_preset_rig(capsys: Any) -> None:
     with pytest.raises(SystemExit):
         tools.main(args)
     assert "health is a YAM tool" in capsys.readouterr().err
+
+
+def test_the_home_ramp_never_jumps_past_the_step_limit(
+    physical_arm: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list[np.ndarray] = []
+
+    class LeftOutside(FakeRobot):
+        def __init__(self, description: Any, **kwargs: Any) -> None:
+            super().__init__(description, **kwargs)
+            # arm_j1 past even the model's limit, arm_j2 past the preset's narrowed one.
+            self.position = np.array([3.0, 1.7, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+        def command(self, values: Any) -> None:
+            sent.append(np.asarray(values, float).copy())
+            super().command(values)
+
+    monkeypatch.setattr(sys.modules["fake_robot_driver"], "FakeRobot", LeftOutside)
+    arm = PresetEmbodiment(str(physical_arm), auto_start=True, sleep=lambda s: None)
+    arm.reset(SCENE)
+    path = np.array([[3.0, 1.7, 0.0, 0.0, 0.0, 0.0, 0.0], *sent])
+    steps = np.abs(np.diff(path, axis=0)).max(axis=0)
+    assert steps[1] <= 0.03 + 1e-9 and steps[6] <= 0.004 + 1e-9
+    assert path[-1][1] == pytest.approx(0.4)  # arm_j2 walked home
+    assert np.all(path[:, 0] == 3.0)  # arm_j1 has no home value: it never moved
+    arm.close()
+
+
+def test_a_failed_watchdog_stop_faults_the_episode(tmp_path: Path) -> None:
+    base = PresetEmbodiment(str(BASE), pace=False)
+    base.reset(SCENE)
+    driver = base._driver
+
+    def broken_stop() -> None:
+        raise RuntimeError("bus timeout")
+
+    driver.stop = broken_stop
+    base.step(Action(data=np.array([0.5, 0.0])))
+    deadline = time.monotonic() + 3
+    while base._fault is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    with pytest.raises(EmbodimentFault, match="could not stop the driver: bus timeout"):
+        base.check_health()
+    with pytest.raises(EmbodimentFault, match="could not stop the driver"):
+        base.step(Action(data=np.array([0.5, 0.0])))
+    base._driver = None  # its stop is broken for good; nothing left to close here
+
+
+def test_the_acceleration_limit_restarts_from_rest_after_a_watchdog_stop() -> None:
+    base = PresetEmbodiment(str(BASE), pace=False)
+    approver, _, _ = build_guardrails(base.info.action_space, None, base)
+    store: dict[str, Any] = {}
+    approver.begin_trial(None, store)
+    base.reset(SCENE)
+    for _ in range(5):
+        approved = approver.review(Action(data=np.array([1.0, 0.0])), store)
+        base.step(approved)
+    assert approved.data[0] == pytest.approx(0.1)
+    deadline = time.monotonic() + 3
+    while base.watchdog_stops == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    resumed = approver.review(Action(data=np.array([1.0, 0.0])), store)
+    assert resumed.data[0] == pytest.approx(0.02)  # from rest, not from 0.1
+    base.close()
+
+
+def test_delta_commands_stop_at_the_position_limit(tmp_path: Path) -> None:
+    shutil.copy(ARM.parent / "mobile_manipulator.urdf", tmp_path)
+    (tmp_path / "delta.toml").write_text(
+        '[robot]\nname = "delta"\nmodel = "mobile_manipulator.urdf"\npolicy_hz = 20\n'
+        'mode = "joint_delta"\n[robot.joints]\nselect = ["arm_j1"]\nmax_step = { arm_j1 = 0.5 }\n'
+    )
+    arm = PresetEmbodiment(str(tmp_path / "delta.toml"), pace=False)
+    arm.reset(SCENE)
+    clamped = []
+    for _ in range(8):
+        result = arm.step(Action(data=np.array([0.5])))
+        clamped.append(bool(result.info.get("position_clamped")))
+    assert result.observation.state["joint_pos"][0] == pytest.approx(2.9)
+    assert clamped[:5] == [False] * 5 and all(clamped[6:])
+    back = arm.step(Action(data=np.array([-0.5])))
+    assert back.observation.state["joint_pos"][0] == pytest.approx(2.4)
+    arm.close()
+
+
+def test_a_fallen_robot_is_refused_at_reset() -> None:
+    base = PresetEmbodiment(str(BASE), pace=False)
+    base.reset(SCENE)
+    base._driver.tilt(60)
+    with pytest.raises(EmbodimentFault, match="tilted 60 degrees from upright"):
+        base.reset(SCENE)
+    base.close()
+
+
+def test_a_driver_that_fails_to_connect_is_closed(
+    physical_arm: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class NoBus(FakeRobot):
+        def connect(self) -> None:
+            raise OSError("no such device")
+
+    monkeypatch.setattr(sys.modules["fake_robot_driver"], "FakeRobot", NoBus)
+    arm = PresetEmbodiment(str(physical_arm), auto_start=True, sleep=lambda s: None)
+    with pytest.raises(OSError, match="no such device"):
+        arm.reset(SCENE)
+    assert FakeRobot.calls[-1] == "close" and arm._driver is None

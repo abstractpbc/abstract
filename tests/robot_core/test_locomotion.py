@@ -214,3 +214,24 @@ def test_episode_motion_integrates_base_velocities(tmp_path: Any) -> None:
     labels, _ = episode.motion(path, spaces, 10.0)
     no_rate, _ = episode.motion(path, spaces)
     assert labels != no_rate
+
+
+def test_teleop_refuses_absolute_targets() -> None:
+    from abstract_harness.robot.core.embodiment import joint_embodiment_info
+    from abstract_harness.robot.core.errors import ConfigError
+    from abstract_harness.robot.core.teleop import TeleopPolicy
+
+    with pytest.raises(ConfigError, match="a command at rest would be a target"):
+        TeleopPolicy().bind(joint_embodiment_info("arm", low=[-1], high=[1]))
+
+
+def test_teleop_sends_zero_for_dimensions_without_commands() -> None:
+    from abstract_harness.robot.core.teleop import TeleopPolicy
+
+    info = EmbodimentInfo(
+        name="base", action_space=base_box(), observation_space=base_obs(), control_hz=50.0
+    )
+    teleop = TeleopPolicy(map="yaw_rate:turn", scale=2.0)
+    teleop.bind(info)
+    chunk = teleop.act(Observation(extra={"commands": {"vx": 0.1, "turn": 0.2}}))
+    np.testing.assert_allclose(chunk.actions[0].data, [0.2, 0.0, 0.4])

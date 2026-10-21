@@ -33,7 +33,7 @@ def test_timing_is_off_by_default_and_recorded_in_the_setup(tmp_path: Path) -> N
     assert config.rig.strict_timing is False and config.rig.async_inference is False
     assert config.rig.timing() is False
     setup = config.setup()
-    assert setup["strict_timing"] is False and setup["async_inference"] is False
+    assert "strict_timing" not in setup and "async_inference" not in setup
 
 
 def test_strict_timing_from_the_rig_section(tmp_path: Path) -> None:

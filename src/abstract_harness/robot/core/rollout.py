@@ -20,7 +20,12 @@ import numpy as np
 
 from abstract_harness.robot.core.approver import Approver
 from abstract_harness.robot.core.command_stream import END_EPISODE
-from abstract_harness.robot.core.controller import _INFER_KEY, _REPORT_KEY, Controller
+from abstract_harness.robot.core.controller import (
+    _DISPATCH_KEY,
+    _INFER_KEY,
+    _REPORT_KEY,
+    Controller,
+)
 from abstract_harness.robot.core.embodiment import Embodiment
 from abstract_harness.robot.core.errors import (
     EmbodimentFault,
@@ -399,7 +404,7 @@ def rollout(
                     record.events.append(operator_message_event(t, text, source))
             command_values: dict[str, float] | None = None
             end_by_command = False
-            if commands is not None:
+            if commands is not None and commands.active:
                 snapshot = commands.snapshot()
                 command_values = dict(snapshot.values)
                 for event in snapshot.events:
@@ -408,6 +413,8 @@ def rollout(
                     )
                     record.events.append(command_event(t, event.name, event.source))
                     end_by_command = end_by_command or event.name == END_EPISODE
+                # Latched even when the event queue was full and dropped the event itself.
+                end_by_command = end_by_command or commands.end_requested()
 
             prev_inferences = len(store.get(_INFER_KEY, []))
             all_approvals = store.get(_APPROVALS_KEY, [])
@@ -424,11 +431,6 @@ def rollout(
                 dict(event) for event in all_command_events[last_command_events_idx:]
             ]
 
-            if end_by_command:
-                record.terminated = True
-                record.termination_reason = OPERATOR_END
-                break
-
             if poll is not None and poll.end is not None:
                 record.terminated = True
                 record.termination_reason = OPERATOR_END
@@ -443,6 +445,12 @@ def rollout(
                             note=poll.end.note,
                         )
                     )
+                break
+
+            if end_by_command:
+                # After the console's own end, so a verdict typed in the same step survives.
+                record.terminated = True
+                record.termination_reason = OPERATOR_END
                 break
 
             try:
@@ -512,12 +520,21 @@ def rollout(
                 raise _record_failure(record, _policy_error(policy, exc), t) from exc
 
             inferences = store.get(_INFER_KEY, [])
-            if len(inferences) > prev_inferences:
+            # What this step's observation carried reached the policy when an inference
+            # took it: at collection for synchronous controllers, at dispatch for a
+            # controller that reports it (AsyncController infers in the background).
+            delivered = (
+                store.get(_DISPATCH_KEY) == t
+                if _DISPATCH_KEY in store
+                else len(inferences) > prev_inferences
+            )
+            if delivered:
                 store["_rollout_last_approvals_idx"] = len(all_approvals)
                 if operator_input is not None:
                     store["_rollout_last_operator_msgs_idx"] = len(all_operator_msgs)
                 if commands is not None:
                     store["_rollout_last_command_events_idx"] = len(all_command_events)
+            if len(inferences) > prev_inferences:
                 latency, chunk_len = inferences[-1]
                 record.events.append(inference_event(t, latency, chunk_len))
                 if stream_ok:
@@ -683,6 +700,12 @@ def rollout(
         raise _CancelledTrial(record.error, record) from exc
     finally:
         _end_operator_trial(operator_input)
+        end_trial = getattr(controller, "end_trial", None)
+        if callable(end_trial) and not end_trial(store):
+            # An inference still runs on the controller's worker: the policy must not be
+            # read (transcript) or reset (the next trial) under it.
+            policy_reset_ok = False
+            record.metadata["policy_abandoned"] = True
         # Preserve measured latencies even when the trial ends in an error.
         record.inference_latencies = [
             lat for lat, _ in store.get(_INFER_KEY, []) if lat is not None

@@ -191,3 +191,36 @@ def test_command_rpc_reports_a_closed_or_stalled_run() -> None:
             controller.cmd_command({"values": {"vx": 0.0}})
     os.close(read_fd)
     os.close(write_fd)
+
+
+def test_serve_command_pipe_alone_is_silent(capsys: Any) -> None:
+    read_fd, write_fd = os.pipe()
+    stream = commands._command_stream(CubePickEmbodiment(), [FdCommandSource(read_fd)])
+    assert stream is not None and not stream.active
+    assert "commands:" not in capsys.readouterr().out
+    os.close(write_fd)
+    stream.close()
+
+
+def test_a_self_paced_run_prints_no_timing_line(capsys: Any) -> None:
+    from dataclasses import replace
+
+    from abstract_harness.robot.core.embodiment import SELF_PACED
+    from abstract_harness.robot.core.mock import ScriptedPolicy
+
+    cube = CubePickEmbodiment()
+    cube.info = replace(cube.info, capabilities=cube.info.capabilities | {SELF_PACED})
+    commands._announce_timing(ScriptedPolicy(), cube, False, False)
+    assert capsys.readouterr().out == ""
+    commands._announce_timing(ScriptedPolicy(), cube, False, True)
+    assert "the embodiment paces itself with async inference" in capsys.readouterr().out
+
+
+def test_command_rpc_refuses_lines_that_could_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    import select
+
+    controller = _controller()
+    controller._commands_fd = 99_999
+    monkeypatch.setattr(select, "PIPE_BUF", 64)
+    with pytest.raises(ValueError, match="command too long"):
+        controller.cmd_command({"values": {f"axis{i}": 0.5 for i in range(10)}})

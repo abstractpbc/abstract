@@ -372,3 +372,112 @@ def test_eval_without_commands_keeps_the_action_log_unchanged(tmp_path: Path) ->
     actions = tmp_path / log.samples[0].trial_metadata[0]["actions"]
     rows = [json.loads(line) for line in actions.read_text().splitlines()[1:]]
     assert all("commands" not in row for row in rows)
+
+
+def test_a_console_verdict_in_the_same_step_wins_over_end_episode() -> None:
+    from abstract_harness.robot.core.console import ConsolePoll, EndRequest
+
+    stream = CommandStream()
+
+    class Console:
+        def begin_trial(self) -> None:
+            return None
+
+        def poll(self) -> ConsolePoll:
+            stream.press(END_EPISODE, source="pad")
+            return ConsolePoll(end=EndRequest(verdict="y", note="clean"))
+
+    record = rollout(
+        CommandPolicy(),  # type: ignore[arg-type]
+        CubePickEmbodiment(),
+        Scene(id="s", instruction="x", init_seed=0),
+        max_steps=5,
+        seed=0,
+        epoch=0,
+        controller=DefaultController(),
+        approver=AutoApprover(),
+        sink=NullSink(),
+        operator_input=Console(),  # type: ignore[arg-type]
+        commands=stream,
+    )
+    assert record.termination_reason == OPERATOR_END
+    assert (record.operator_judgement, record.operator_note) == ("y", "clean")
+
+
+def test_an_unused_free_form_stream_leaves_observations_and_records_unchanged() -> None:
+    stream = CommandStream()  # what every serve run gets: a channel nobody has used yet
+    seen: list[dict[str, Any]] = []
+
+    class Recording(CommandPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            seen.append(dict(observation.extra))
+            if observation.extra["env_step"] == 2:
+                stream.set("vx", 0.4, source="rpc")
+            return ActionChunk(actions=[Action(data=np.zeros(2))])
+
+    assert not stream.active
+    record = rollout(
+        Recording(),  # type: ignore[arg-type]
+        CubePickEmbodiment(),
+        Scene(id="s", instruction="x", init_seed=0),
+        max_steps=4,
+        seed=0,
+        epoch=0,
+        controller=DefaultController(),
+        approver=AutoApprover(),
+        sink=NullSink(),
+        commands=stream,
+    )
+    assert ["commands" in extra for extra in seen] == [False, False, False, True]
+    assert seen[3]["commands"] == {"vx": 0.4}
+    assert [step.commands for step in record.steps] == [None, None, None, {"vx": 0.4}]
+    assert stream.active
+
+
+def test_declared_streams_are_active_from_the_start() -> None:
+    assert CommandStream([AxisSpec("vx")]).active
+    assert CommandStream(events=["go"]).active
+
+
+def test_a_silent_wireless_pad_returns_its_sticks_to_rest() -> None:
+    clock = Clock()
+    stream = CommandStream([AxisSpec("vx", timeout_s=None)], clock=clock)
+    pad = JoystickSource(axes=[AxisBinding("vx", axis=1)], max_silence_s=1.0, clock=clock)
+    pad.handle(stream, 32767, 0x02, 1)
+    assert stream.peek()["vx"] == pytest.approx(1.0)
+    clock.now = 0.9
+    pad._publish(stream)  # a republish inside the silence limit keeps the value
+    assert stream.peek()["vx"] == pytest.approx(1.0)
+    clock.now = 1.5  # no event from the pad for longer than max_silence_s
+    pad._publish(stream)
+    assert stream.peek()["vx"] == 0.0
+    pad.handle(stream, 32767, 0x02, 1)  # it speaks again
+    assert stream.peek()["vx"] == pytest.approx(1.0)
+
+
+def test_end_episode_ends_the_trial_even_when_the_queue_dropped_it() -> None:
+    from abstract_harness.robot.core import command_stream
+
+    stream = CommandStream()
+
+    class Flooding(CommandPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            for _ in range(command_stream.MAX_QUEUED_EVENTS + 5):
+                stream.press("noise")
+            stream.press(END_EPISODE)
+            return ActionChunk(actions=[Action(data=np.zeros(2))])
+
+    record = rollout(
+        Flooding(),  # type: ignore[arg-type]
+        CubePickEmbodiment(),
+        Scene(id="s", instruction="x", init_seed=0),
+        max_steps=20,
+        seed=0,
+        epoch=0,
+        controller=DefaultController(),
+        approver=AutoApprover(),
+        sink=NullSink(),
+        commands=stream,
+    )
+    assert stream.dropped_events > 0
+    assert record.termination_reason == OPERATOR_END and len(record.steps) == 1

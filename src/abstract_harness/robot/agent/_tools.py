@@ -141,6 +141,11 @@ class Toolset:
         """The motion tool's name: move_joints, move_to, move_by or drive."""
         return self._move_tool
 
+    @property
+    def values_key(self) -> str:
+        """The motion tool's argument naming its values: targets, deltas or velocities."""
+        return "targets" if self._absolute else "velocities" if self._drive else "deltas"
+
     def state_labels(self) -> tuple[str, tuple[str, ...]] | None:
         """Return the state field and per-element labels selected at build time."""
         return self._state_labels

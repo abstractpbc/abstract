@@ -64,10 +64,12 @@ def test_late_steps_count_as_overruns_and_never_burst() -> None:
     pacer.wait()
     clock.now += 0.15  # 50 ms late for tick 1: an overrun inside one period
     assert pacer.wait() == pytest.approx(0.05)
-    clock.now += 0.35  # tick 2 was due 50 ms after the previous dispatch: 300 ms late
+    # The schedule re-anchored at that dispatch: the next step waits a full period
+    # instead of going out 50 ms later to catch up.
+    pacer.wait()
+    assert clock.sleeps[-1] == pytest.approx(0.1)
+    clock.now += 0.4  # 300 ms late
     assert pacer.wait() == pytest.approx(0.3)
-    # More than one period late: the schedule re-anchors at this dispatch, so the next
-    # tick is a full period later rather than an immediate catch-up burst.
     assert pacer.missed_ticks == 3
     pacer.wait()
     assert clock.sleeps[-1] == pytest.approx(0.1)
@@ -75,6 +77,18 @@ def test_late_steps_count_as_overruns_and_never_burst() -> None:
     assert report["overruns"] == 2 and report["missed_ticks"] == 3
     assert report["max_late_ms"] == pytest.approx(300.0)
     assert pacer.consecutive_overruns == 0
+
+
+def test_a_slow_loop_is_spaced_by_at_least_a_period() -> None:
+    clock = FakeClock()
+    pacer = _pacer(clock)
+    dispatched = []
+    for _ in range(6):
+        pacer.wait()
+        dispatched.append(clock.now)
+        clock.now += 0.19  # every step's work takes nearly two periods
+    gaps = [b - a for a, b in zip(dispatched, dispatched[1:], strict=False)]
+    assert min(gaps) >= 0.1 - 1e-9
 
 
 def test_lateness_within_tolerance_is_on_time() -> None:

@@ -8,6 +8,7 @@ passes everything through; clamping/operator approval land in rollout hardening.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, get_args, runtime_checkable
 
@@ -293,10 +294,19 @@ class AccelerationLimitApprover:
     as acceleration / control rate) from the last approved command, starting from rest
     (zeros) at every trial. A decelerating command is limited too, so stopping ramps; the
     embodiment's own watchdog or stop path is what halts at once. A modified action is
-    flagged ``meta["accel_clamped"]``; ``NaN`` raises ``SafetyAbort``.
+    flagged ``meta["accel_clamped"]``; ``NaN`` raises ``SafetyAbort``. ``rest``, when
+    given, is asked before each review whether the robot was brought to rest outside
+    the policy's control (an embodiment's watchdog); if so, the limit ramps from zero
+    again rather than from the last approved command.
     """
 
-    def __init__(self, action_space: Box, max_change: float | Any):
+    def __init__(
+        self,
+        action_space: Box,
+        max_change: float | Any,
+        *,
+        rest: Callable[[], bool] | None = None,
+    ):
         from abstract_harness.robot.core.spaces import RATE_CONTROL_MODES
 
         sem = action_space.semantics
@@ -307,6 +317,7 @@ class AccelerationLimitApprover:
             )
         self._max = _validate_max_delta(max_change, action_space.shape, action_space.dim)
         self._key = f"accel_limit:{id(self)}"
+        self._rest = rest
 
     def begin_trial(self, reference: Any, store: dict[str, Any]) -> None:
         """Every trial starts from rest, whatever the measured reference."""
@@ -317,6 +328,8 @@ class AccelerationLimitApprover:
         data = np.asarray(action.data, dtype=np.float64)
         if bool(np.isnan(data).any()):
             raise SafetyAbort("AccelerationLimitApprover: action contains NaN")
+        if self._rest is not None and self._rest():
+            store[self._key] = np.zeros_like(self._max)
         previous = np.asarray(store.get(self._key, np.zeros_like(self._max)), dtype=np.float64)
         approved = np.clip(data, previous - self._max, previous + self._max)
         store[self._key] = approved.copy()

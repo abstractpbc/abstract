@@ -319,7 +319,18 @@ class PolicyBehavior:
         return "now " + ", ".join(changed)
 
     def stop(self) -> None:
-        return None
+        """Wait (bounded) for an inference the controller still runs in the background."""
+        end_trial = getattr(self.controller, "end_trial", None)
+        if callable(end_trial):
+            end_trial(self._store)
+
+    def busy(self) -> bool:
+        """Whether an inference of this job is still running on a controller worker, so
+        the shared policy must not be reset for another job yet."""
+        from abstract_harness.robot.core.controller import _ASYNC_KEY
+
+        worker = getattr(self._store.get(_ASYNC_KEY), "worker", None)
+        return worker is not None and worker.is_alive()
 
 
 class MotionBehavior:

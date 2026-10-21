@@ -9,12 +9,12 @@ faster than its configured rate and a step's timing no longer depends on how lon
 previous inference took.
 
 A step that cannot be dispatched on time is an *overrun*. The pacer never bursts to
-catch up: a step more than one period late re-anchors the schedule at the moment it is
-dispatched, and the missed ticks are counted. Every trial records its timing report
-(``TrialRecord.metadata["timing"]``): rate, ticks, overruns, missed ticks, the worst
-lateness and the effective rate. ``max_consecutive_overruns`` turns sustained lateness
-into a ``SafetyAbort`` (the eval halts and a physical embodiment parks), for robots whose
-controllers are unsafe at an irregular rate.
+catch up: a late step re-anchors the schedule at the moment it is dispatched, so the
+next step still waits a full period, and the ticks it skipped are counted. Every trial
+records its timing report (``TrialRecord.metadata["timing"]``): rate, ticks, overruns,
+missed ticks, the worst lateness and the effective rate. ``max_consecutive_overruns``
+turns sustained lateness into a ``SafetyAbort`` (the eval halts and a physical embodiment
+parks), for robots whose controllers are unsafe at an irregular rate.
 
 Strict timing paces dispatch; it does not make inference faster. Pair it with
 ``AsyncController`` (``core/controller.py``) so slow inference runs while buffered actions
@@ -159,8 +159,9 @@ class Pacer:
                 self._sleep(deadline - now)
                 now = self._clock()
             late = max(0.0, now - deadline)
-            if late > self.period_s:
-                # Never burst: re-anchor at this dispatch and count the ticks it skipped.
+            if late > self.tolerance_s:
+                # Never burst: re-anchor at this dispatch, so the next step waits a full
+                # period, and count the ticks it skipped.
                 self.missed_ticks += math.floor(late * self.hz + 1e-9)
                 self._anchor = now
                 self._k = 0

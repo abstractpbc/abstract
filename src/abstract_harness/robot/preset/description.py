@@ -109,6 +109,10 @@ class RobotDescription:
     state_fields: tuple[StateField, ...]
     digest: str
     driver_args: dict[str, Any] = field(default_factory=dict)
+    # joint_delta and joint_vel: the joints' position limits (NaN where unknown), which
+    # the action bounds (steps, velocities) do not cover.
+    position_limits: tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None = None
+    command_timeout_s: float = 0.25
 
     @property
     def dim(self) -> int:
@@ -344,6 +348,7 @@ def _controller_source(decl: ControllerDecl, axes: list[AxisSpec]) -> CommandSou
         buttons=buttons,
         deadman=deadman,
         refresh_hz=decl.refresh_hz,
+        max_silence_s=decl.max_silence_s,
         source=decl.name,
     )
 
@@ -372,6 +377,12 @@ def _select_joints(section: RobotSection, model: RobotModel | None) -> list[Mode
     by_name = {joint.name: joint for joint in pool}
     names = list(by_name)
     if section.joints.select is None:
+        if model is not None and model.unresolved_actuators:
+            raise PresetError(
+                f"{model.path.name} has actuators that drive no joint "
+                f"({', '.join(model.unresolved_actuators)}), so actuator order cannot pick "
+                "the action's joints; list them in [robot.joints] select"
+            )
         chosen = names
     else:
         chosen = []
@@ -486,10 +497,10 @@ def _state_fields(section: RobotSection, joints: list[ModelJoint]) -> tuple[Stat
     keys = section.state.fields
     if keys is None:
         keys = list(_DEFAULT_STATE.get(section.mode, ("joint_pos",)))
-    if section.mode == "joint_pos" and "joint_pos" not in keys:
+    if section.mode != "base_vel" and "joint_pos" not in keys:
         raise PresetError(
-            "joint_pos control needs joint_pos in [robot.state] fields: it is the measured "
-            "reference every target is limited against"
+            f"{section.mode} control needs joint_pos in [robot.state] fields: it is the "
+            "measured reference every command is limited against"
         )
     fields = []
     for key in keys:
@@ -644,6 +655,13 @@ def load_preset(path: Path | str) -> RobotDescription:
             _frame(sensor.frame, model, f"sensor {sensor.name}")
     state_fields = _state_fields(section, joints)
     _check_commands(section)
+    position_limits = None
+    if section.mode in ("joint_delta", "joint_vel"):
+        # Their [robot.joints] limits bound steps or velocities; positions keep the model's.
+        position_limits = (
+            np.array([np.nan if j.lower is None else j.lower for j in joints], dtype=np.float64),
+            np.array([np.nan if j.upper is None else j.upper for j in joints], dtype=np.float64),
+        )
     digest = hashlib.sha256(raw + (model.digest.encode() if model is not None else b"")).hexdigest()
     return RobotDescription(
         name=section.name,
@@ -666,6 +684,8 @@ def load_preset(path: Path | str) -> RobotDescription:
         state_fields=state_fields,
         digest=digest,
         driver_args=dict(section.driver_args),
+        position_limits=position_limits,
+        command_timeout_s=section.command_timeout,
     )
 
 

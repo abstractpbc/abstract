@@ -8,7 +8,10 @@ Additive and opt-in: without the new settings, runs, logs and the public API beh
   `[rig] strict_timing` hold each step to the embodiment's rate and record overruns, missed
   ticks, lateness and the effective rate per trial; `max_consecutive_overruns` aborts.
 - `AsyncController` (`--async-inference`): background inference with prefetch, stale-action
-  dropping and hold-on-underrun; refuses `observe()` policies.
+  dropping, late playback of wholly stale chunks, stop requests that survive both, and
+  hold-on-underrun; refuses `observe()`/`transcript_delta()` policies; the rollout joins
+  an in-flight inference before reading or resetting the policy (optional controller
+  `end_trial` hook) and counts events delivered at dispatch (`_DISPATCH_KEY`).
 - Live commands (`core/command_stream.py`): `CommandStream` axes with ranges and deadman
   timeouts plus events, fed by a Linux gamepad, UDP, `robot run --commands/--commands-fd`
   and serve's new `command` RPC; injected as `extra["commands"]` and
@@ -19,7 +22,8 @@ Additive and opt-in: without the new settings, runs, logs and the public API beh
   `[rig] preset`; examples in `robots/` including a Unitree G1 template.
 - Locomotion: the `base_vel` control mode, base/IMU canonical state keys,
   `AccelerationLimitApprover`, a rate-mode watchdog and fall detection in presets, the
-  agent's `drive` tool, and the `teleop` policy (`[vla] policy = "teleop"`).
+  agent's `drive` tool, and the `teleop` policy for displacement and velocity modes
+  (`[vla] policy = "teleop"`).
 - The orchestrator (`robot/orchestrator`, policy `orchestrator`, `[agent] policy =
   "orchestrator"`): extension tools, packaged policies and skills, run as background jobs
   whose events wake the model, with `wait`, `stop_job`, `steer_job` and `jobs`.

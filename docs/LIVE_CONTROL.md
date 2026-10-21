@@ -32,8 +32,8 @@ eval(task, policy, robot, strict_timing=StrictTiming(hz=50, max_consecutive_over
 
 Step `k` of a trial is dispatched no earlier than `start + k / hz`. A step that misses its
 deadline by more than a tenth of a period is an overrun. The schedule never bursts to
-catch up: a step more than one period late restarts the schedule at that step, and the
-skipped ticks are counted. Each trial's report lands in its metadata under `timing`:
+catch up: a late step restarts the schedule at that step, so the next step still waits
+a full period, and the skipped ticks are counted. Each trial's report lands in its metadata under `timing`:
 `hz`, `ticks`, `overruns`, `missed_ticks`, `max_late_ms`, `mean_overrun_late_ms` and
 `effective_hz`.
 
@@ -50,18 +50,27 @@ a worker thread while the buffered actions keep playing:
 - The first step of a trial waits for one inference.
 - When `prefetch` or fewer actions remain (half the last chunk by default), the next
   inference starts from the current observation.
+- No observation is sent to the policy twice.
 - A chunk computed from step `q` that arrives at step `t` drops its first `t - q` actions,
-  which were for steps that already ran. The rest replace the buffer.
+  which were for steps that already ran. The rest replace the buffer. If the whole chunk
+  is stale, its last action runs one or more steps late, marked `meta["late"]`. This
+  happens with a one-action reactive policy, or when latency exceeds the chunk.
 - If the buffer runs dry, the robot holds. An absolute target repeats its last value.
   Displacements and velocities send zeros. Hold actions carry `meta["hold"]`;
   `underrun="wait"` blocks instead.
-- An action that requests the trial's end is never replaced by a later prediction.
+- A stop request is never lost. A buffered one is not replaced by a later prediction,
+  and one on a dropped stale action is carried by the next action.
 - Inference running longer than `timeout_s` (120 s) raises `SafetyAbort`.
 
-The controller's counts (inferences, holds, stale actions and chunks) land in the trial
-metadata under `controller`. Policies with an `observe()` hook, such as stateful world
-models that must see every control observation in order, are refused: `observe()` would
-run concurrently with `act()`. Use async inference on a paced loop. On an unpaced
+The controller's counts (inferences, holds, late and stale actions) land in the trial
+metadata under `controller`. Approvals, operator messages and command events count as
+delivered at the step whose observation went to the policy, so none are lost while
+inference runs. Only `act()` runs on the worker. Policies whose `observe()` or
+`transcript_delta()` hooks would run concurrently with it are refused: stateful world
+models that must see every control observation in order, and the LLM agent. At a
+trial's end, the rollout waits up to `join_timeout_s` (2 s) for an inference still in
+flight before resetting or reading the policy; one that does not return marks the policy
+abandoned. Use async inference on a paced loop. On an unpaced
 simulator, the loop spins through hold steps while inference runs.
 
 ## Live commands
@@ -86,7 +95,7 @@ def locomotion_policy(observation):
 An axis that stops updating returns to its default: a dropped gamepad or network link
 stops a velocity command instead of repeating it forever. A stream with declared axes
 refuses other names and clamps values to their ranges. A stream without declared axes
-accepts any name and drops a value that goes 0.5 s without an update. Each trial starts
+accepts any name, drops a value that goes 0.5 s without an update, and joins observations only once it has carried a command. So `serve`'s command channel changes nothing until a client uses it. Each trial starts
 at rest with no queued events. The `end_episode` event ends the trial as the console's
 Esc does, including while inference is pending on a physical run. Commands are policy
 inputs: they reach the robot only through the policy's actions, which still pass the
@@ -103,13 +112,16 @@ Sources:
 
 A gamepad reports only changes, so the joystick source republishes held stick values
 (50 Hz by default) to keep them inside their axes' timeouts. A pad that disconnects stops
-republishing, and its axes return to rest.
+republishing, and its axes return to rest. So does a wireless pad that goes silent with
+its device still open, after `max_silence_s` (1 s) without any event.
 
 ## Teleop
 
 The `teleop` policy maps each action dimension to the live command of the same name.
-`map = "yaw_rate:turn"` renames; `scale` scales. A dimension without a command holds:
-zero for displacements and velocities, and the measured position for absolute targets.
+`map = "yaw_rate:turn"` renames; `scale` scales. A dimension without a command sends zero.
+Teleop drives displacement and velocity modes only, where zero is rest. It refuses
+absolute targets: there, a command timing out to its default would be a place to move
+to.
 With a `base_vel` preset and a gamepad, this is joystick driving with the bounds clamp,
 the acceleration limit, the watchdog and fall detection in force.
 [rigs/mobile-base-teleop.toml](../rigs/mobile-base-teleop.toml) does this in the simulator.

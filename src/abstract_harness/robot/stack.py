@@ -237,6 +237,7 @@ def policy_probe(config: RobotConfig) -> dict[str, Any]:
 
         from abstract_harness.robot.core import Observation, Scene, resolve
         from abstract_harness.robot.core.compat import check_compatibility
+        from abstract_harness.robot.core.spaces import RATE_CONTROL_MODES
         from abstract_harness.robot.yam.config import DEFAULT_JOINT_HOME_POSE
     except ImportError as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
@@ -270,6 +271,12 @@ def policy_probe(config: RobotConfig) -> dict[str, Any]:
             or ("joint_pos",)
         )
         obs_state = {key: state.copy() for key in state_keys}
+        # A declared field of another shape (a base's 3-D gravity next to a 2-D velocity
+        # action) gets zeros of its own shape rather than the action-shaped reference.
+        spec = embodiment.info.observation_space.state
+        for state_field in spec.fields if spec is not None else ():
+            if state_field.key in obs_state and state_field.shape != state.shape:
+                obs_state[state_field.key] = np.zeros(state_field.shape, np.float64)
         policy.reset(Scene(id="abstract-robot-check", instruction="hold still"))
         started = time.perf_counter()
         chunk = policy.act(Observation(images=images, state=obs_state))
@@ -278,6 +285,9 @@ def policy_probe(config: RobotConfig) -> dict[str, Any]:
         out["expected_dim"] = dim
         out["chunk_shape"] = list(actions.shape)
         out["first_step_rad"] = round(float(np.abs(actions[0] - state).max()), 4)
+        if space.semantics is not None and space.semantics.control_mode in RATE_CONTROL_MODES:
+            # A velocity is not a displacement from home: report it in its own units.
+            out["control_mode"] = space.semantics.control_mode
         if space.low is not None and space.high is not None:
             out["outside_bounds"] = int(((actions < space.low) | (actions > space.high)).sum())
         else:

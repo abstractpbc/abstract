@@ -54,6 +54,7 @@ mode = "joint_pos"             # joint_pos | joint_delta | joint_vel | base_vel
 driver = "g1_driver.py:G1Driver"   # "sim", "module:Class" or "file.py:Class" (relative to the preset)
 pace = true                    # step() waits out the policy period (default true)
 auto_start = false             # physical drivers: skip the readiness gates (a notice prints)
+command_timeout_s = 0.25       # rate modes: the watchdog's timeout (at least two policy periods)
 command_events = ["go", "stop"]
 description = "Free text appended to the operating notes policies read."
 
@@ -76,9 +77,14 @@ names or globs:
 actuator: `name`, `type` (`revolute`, `prismatic` or `continuous`), `lower`, `upper` and
 `velocity`. With such declarations, a preset needs no model at all.
 
-For `joint_vel`, limits come from each joint's velocity limit. MJCF hinge ranges are read
-in degrees unless `<compiler angle="radian">`; joint `<default>` classes and `<include>`
-files are followed.
+For `joint_vel`, limits come from each joint's velocity limit. In `joint_delta` and
+`joint_vel` modes, a command that would carry a joint past the model's position limits is
+shortened to stop at the limit. It is never reversed, so a joint already past a limit can
+only move back in. MJCF hinge ranges are read
+in degrees unless `<compiler angle="radian">`. Joint `<default>` classes, `<include>`
+files, every `<worldbody>` and `<actuator>` section, and `<frame>` groups are followed. An
+actuator that drives a tendon or a site, not a joint, makes the default selection refuse
+until `select` lists the joints.
 
 **Parts.** `[robot.parts]` maps a part name to joints (`left_arm = ["left_shoulder_*",
 ...]`). Parts become the action's `dim_parts`: episode labels report per part, and
@@ -136,12 +142,14 @@ max_tilt_deg = 30                             # fall detection
 - The **acceleration limit** is an `AccelerationLimitApprover` in the guardrail chain,
   shown as `accel-limit`. It caps each step's change at `max_accel / policy_hz`, starting
   from rest. Stopping ramps too.
-- The **watchdog** stops the driver when no step arrives within `command_timeout_s`, for
-  example during slow inference or a stalled loop. The next step resumes motion. It runs
-  for `base_vel` and `joint_vel`.
+- The **watchdog** stops the driver when no step arrives within `command_timeout_s`
+  (here or in `[robot]`; at least two policy periods). Examples are slow synchronous
+  inference or a stalled loop. The next step resumes motion, and the acceleration limit
+  ramps it up again from rest. A `stop()` that fails is retried, and the next step or
+  health check faults the episode. It runs for `base_vel` and `joint_vel`.
 - **Fall detection** works in any mode. Past `max_tilt_deg` from upright, measured from
   `projected_gravity` or `base_quat`, the driver stops and the episode ends with
-  `fall_detected`.
+  `fall_detected`. A reset refuses to start from a robot already past it.
 
 A legged robot that walks with a learned controller usually keeps `mode = "joint_pos"`: the
 locomotion policy outputs joint targets and reads velocity commands from the live
@@ -206,7 +214,9 @@ class MyDriver:
 ```
 
 The embodiment owns everything else. It runs the readiness gates, ramps to the home pose
-no faster than the per-step limits, and paces steps to `policy_hz`. It validates every
+no faster than the per-step limits, and paces steps to `policy_hz`. A joint left past a
+narrowed limit walks back in at the step limit; a joint without a home value does not
+move. It validates every
 `read()`: a missing field, a wrong shape or a non-finite value is an `EmbodimentFault`.
 It also runs the watchdog and fall detection, and calls `stop()` and `close()` on every
 exit path.
@@ -218,8 +228,9 @@ responsibility.
 
 On a physical driver, `reset()` asks the operator twice through the run's console: once
 before the home ramp (once per connection) and once before the episode starts.
-Without an attended terminal, a physical preset refuses to reset unless it sets
-`auto_start = true`, which prints a notice instead. Keep someone at the hardware stop.
+Without an attended terminal, a physical preset refuses to reset, before connecting
+anything, unless it sets `auto_start = true`, which prints a notice instead. A driver whose
+`connect()` fails is closed. Keep someone at the hardware stop.
 
 `driver = "sim"` is the built-in `SimDriver`, a kinematic stand-in with no physics.
 Joint targets track with an optional lag (`tau_s`), deltas and velocities integrate, a

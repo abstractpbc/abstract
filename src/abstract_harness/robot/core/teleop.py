@@ -1,9 +1,12 @@
 """``teleop``: drive any embodiment from live commands, through the same guardrails.
 
 Each action dimension takes the live command of the same name
-(``observation.extra["commands"]``, ``core/command_stream.py``) times ``scale``. A
-dimension without a command holds: zero for displacements and velocities, the measured
-position for absolute targets. With a robot preset whose gamepad maps sticks to
+(``observation.extra["commands"]``, ``core/command_stream.py``) times ``scale``; a
+dimension without a command sends zero. Teleop drives displacement and velocity modes
+only: there zero is rest, so a command that times out to its default stops the robot.
+An absolute target's default would be a place to move to, so absolute modes are
+refused; drive them with a policy that integrates commands. With a robot preset whose
+gamepad maps sticks to
 ``vx``, ``vy`` and ``yaw_rate`` on a ``base_vel`` base, this is joystick driving with
 the bounds clamp, the acceleration limit, the watchdog and fall detection in force.
 ``map`` renames: ``"yaw_rate:turn,vx:forward"`` reads the ``turn`` and ``forward``
@@ -18,7 +21,7 @@ import numpy as np
 
 from abstract_harness.robot.core.errors import ConfigError
 from abstract_harness.robot.core.policy import PolicyBase, PolicyConfig, PolicyInfo
-from abstract_harness.robot.core.spaces import ABSOLUTE_CONTROL_MODES, Box, reference_state_keys
+from abstract_harness.robot.core.spaces import ABSOLUTE_CONTROL_MODES, Box
 from abstract_harness.robot.core.types import Action, ActionChunk, Observation
 
 if TYPE_CHECKING:
@@ -43,8 +46,6 @@ class TeleopPolicy(PolicyBase):
         self.info = PolicyInfo(name="teleop", action_space=Box(shape=(1,)))
         self.config = PolicyConfig()
         self._labels: tuple[str, ...] = ()
-        self._absolute = False
-        self._state_key: str | None = None
 
     def bind(self, embodiment_info: EmbodimentInfo) -> None:
         space = embodiment_info.action_space
@@ -55,14 +56,11 @@ class TeleopPolicy(PolicyBase):
         unknown = sorted(set(self.renames) - set(self._labels))
         if unknown:
             raise ConfigError(f"teleop map names {unknown}, not action dimensions")
-        self._absolute = semantics.control_mode in ABSOLUTE_CONTROL_MODES
-        if self._absolute:
-            keys = reference_state_keys(
-                embodiment_info.observation_space.state, space.dim, semantics.control_mode
+        if semantics.control_mode in ABSOLUTE_CONTROL_MODES:
+            raise ConfigError(
+                f"teleop drives displacement and velocity modes, not "
+                f"{semantics.control_mode!r}: a command at rest would be a target to move to"
             )
-            if len(keys) != 1:
-                raise ConfigError("teleop on absolute targets needs one reference state field")
-            self._state_key = keys[0]
         self.info = PolicyInfo(
             name="teleop",
             action_space=space,
@@ -74,11 +72,7 @@ class TeleopPolicy(PolicyBase):
         if not self._labels:
             raise ConfigError("teleop.act() before bind()")
         commands: Any = observation.extra.get("commands") or {}
-        if self._absolute:
-            assert self._state_key is not None
-            data = np.asarray(observation.state[self._state_key], dtype=np.float64).copy()
-        else:
-            data = np.zeros(len(self._labels))
+        data = np.zeros(len(self._labels))
         for index, label in enumerate(self._labels):
             value = commands.get(self.renames.get(label, label))
             if isinstance(value, int | float) and not isinstance(value, bool):

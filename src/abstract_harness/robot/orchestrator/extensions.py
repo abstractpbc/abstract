@@ -100,14 +100,17 @@ class ToolSpec:
         }
 
 
-def validate_arguments(schema: Mapping[str, Any], arguments: Any) -> str | None:
-    """A small JSON Schema check of a call's arguments: an object, required keys present,
-    declared property types and enums respected, no extra keys when
-    ``additionalProperties`` is false. Returns the problem, or ``None``."""
+def validate_arguments(
+    schema: Mapping[str, Any], arguments: Any, *, partial: bool = False
+) -> str | None:
+    """A small JSON Schema check of a call's arguments: an object, required keys present
+    (unless ``partial``, for a steer that changes some of them), declared property types
+    and enums respected, no extra keys when ``additionalProperties`` is false. Returns
+    the problem, or ``None``."""
     if not isinstance(arguments, dict):
         return "arguments must be a JSON object"
     properties = schema.get("properties") or {}
-    for name in schema.get("required") or ():
+    for name in () if partial else schema.get("required") or ():
         if name not in arguments:
             return f"missing required argument {name!r}"
     if schema.get("additionalProperties") is False:

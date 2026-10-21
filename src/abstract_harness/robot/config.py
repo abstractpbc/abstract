@@ -341,14 +341,15 @@ class RigConfig(Record):
         if isinstance(data, Mapping) and data.get("preset") is not None:
             if data.get("type", PRESET) != PRESET:
                 raise ValueError(f'[rig] preset needs type = "{PRESET}" (or no type)')
-            if "preset" in (data.get("embodiment") or {}):
-                raise ValueError("set the preset in [rig] preset, not [rig.embodiment]")
             return {**data, "type": PRESET}
         return data
 
     @model_validator(mode="after")
     def channels_explicit(self) -> Self:
-        if self.type == PRESET and self.preset is None and "preset" not in self.embodiment:
+        if self.type == PRESET and "preset" in self.embodiment:
+            # Only [rig] preset resolves against this file; an embodiment argument would not.
+            raise ValueError("set the preset in [rig] preset, not [rig.embodiment]")
+        if self.type == PRESET and self.preset is None:
             raise ValueError('[rig] type = "preset" needs [rig] preset = "<robot preset TOML>"')
         # Which CAN interface drives which arm depends on the rig's wiring, and yam_arms'
         # defaults (left can0, right can1) are only a guess; never rely on them.
@@ -420,17 +421,18 @@ class RobotConfig(Record):
 
     def setup(self, base_url: str | None = None) -> dict[str, Any]:
         """Every argument a run of this config gives its components."""
-        return redact(
-            {
-                "policy": self.policy_name,
-                "policy_args": self.policy_args(base_url),
-                "embodiment": self.rig.type,
-                "embodiment_args": self.embodiment_args(),
-                "max_steps": self.rig.max_steps,
-                "strict_timing": self.rig.strict_timing,
-                "async_inference": self.rig.async_inference,
-            }
-        )
+        setup: dict[str, Any] = {
+            "policy": self.policy_name,
+            "policy_args": self.policy_args(base_url),
+            "embodiment": self.rig.type,
+            "embodiment_args": self.embodiment_args(),
+            "max_steps": self.rig.max_steps,
+        }
+        # Recorded when on, so a run that uses neither keeps its setup unchanged.
+        for key in ("strict_timing", "async_inference"):
+            if getattr(self.rig, key):
+                setup[key] = True
+        return redact(setup)
 
     @classmethod
     def load(cls, path: Path) -> Self:
@@ -444,10 +446,12 @@ class RobotConfig(Record):
 
         rig, store = loaded.rig, loaded.store
         agent = loaded.agent
-        if agent is not None and isinstance(agent.args.get("extensions"), str):
+        extensions = agent.args.get("extensions") if agent is not None else None
+        if agent is not None and isinstance(extensions, str | list):
             # Extension files, like log_root, are relative to this file; module names stay.
+            items = extensions.split(",") if isinstance(extensions, str) else extensions
             resolved = []
-            for entry in (item.strip() for item in str(agent.args["extensions"]).split(",")):
+            for entry in (str(item).strip() for item in items):
                 target, sep, attribute = entry.rpartition(":")
                 if not sep:
                     target, attribute = entry, ""

@@ -16,8 +16,10 @@ An axis declared with ``AxisSpec`` clamps to its range and falls back to its def
 no update arrives within ``timeout_s``: a deadman, so a dropped joystick or network link
 stops a velocity command instead of repeating it forever. A stream with declared axes
 refuses undeclared names; a stream without any accepts any name and drops a value that
-goes ``default_timeout_s`` without an update. Each trial starts from the defaults with no
-queued events.
+goes ``default_timeout_s`` without an update. Such a free-form stream joins observations
+only once it has carried a command (``active``), so a run that offers a command channel
+nobody uses (every ``abstract robot serve`` run) observes and logs exactly as without one.
+Each trial starts from the defaults with no queued events.
 
 The event ``end_episode`` is reserved: it ends the trial as the console's Esc does, also
 while inference is pending on physical runs. Commands are inputs to the policy and never
@@ -156,6 +158,7 @@ class CommandStream:
         self._end = False
         self._sources: list[CommandSource] = list(sources)
         self._started = False
+        self._carried = False
         self.dropped_events = 0
         self.rejected = 0
 
@@ -182,6 +185,7 @@ class CommandStream:
         with self._lock:
             for name, number in checked.items():
                 self._values[name] = (number, now)
+            self._carried = self._carried or bool(checked)
 
     def press(self, name: str, *, source: str = "api") -> None:
         """Queue one discrete event (``end_episode`` ends the trial)."""
@@ -191,6 +195,7 @@ class CommandStream:
             declared = ", ".join(sorted(self.event_names))
             raise ValueError(f"unknown event {name!r}; declared: {declared}")
         with self._lock:
+            self._carried = True
             if name == END_EPISODE:
                 self._end = True
             if len(self._events) >= MAX_QUEUED_EVENTS:
@@ -233,6 +238,13 @@ class CommandStream:
         """The live values without draining events."""
         with self._lock:
             return self._live_values(self._clock())
+
+    @property
+    def active(self) -> bool:
+        """Whether observations carry this stream: it declares axes or events, or it has
+        carried a command."""
+        with self._lock:
+            return bool(self.axes) or self.event_names is not None or self._carried
 
     def end_requested(self) -> bool:
         """Whether ``end_episode`` arrived during this trial (not consumed by reading)."""
@@ -470,8 +482,10 @@ class JoystickSource(_ThreadSource):
     Sticks drive axes (``AxisBinding``) and buttons queue events or set axes
     (``ButtonBinding``). The pad reports only changes, so held stick values are
     republished at ``refresh_hz`` to stay inside their axes' deadman timeouts; a pad
-    that disconnects stops republishing and its axes fall back to rest. With a
-    ``deadman`` button, sticks count only while it is held.
+    that disconnects stops republishing and its axes fall back to rest. A wireless pad
+    can also go silent with its device still open (out of range, flat battery): after
+    ``max_silence_s`` without any event, the sticks publish rest until the pad speaks
+    again. With a ``deadman`` button, sticks count only while it is held.
     """
 
     name = "joystick"
@@ -484,10 +498,17 @@ class JoystickSource(_ThreadSource):
         buttons: Sequence[ButtonBinding] = (),
         deadman: int | None = None,
         refresh_hz: float = 50.0,
+        max_silence_s: float = 1.0,
         source: str = "joystick",
         opener: Callable[[str], Any] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
+        if isinstance(max_silence_s, bool) or not max_silence_s > 0:
+            raise ConfigError("max_silence_s must be positive")
+        self.max_silence_s = float(max_silence_s)
+        self._clock = clock
+        self._last_event: float | None = None
         self.device = device
         self.axes = tuple(axes)
         self.buttons = {binding.button: binding for binding in buttons}
@@ -500,7 +521,8 @@ class JoystickSource(_ThreadSource):
         self.connected = False
 
     def _publish(self, stream: CommandStream) -> None:
-        enabled = self.deadman is None or self.deadman in self._held
+        silent = self._last_event is None or self._clock() - self._last_event > self.max_silence_s
+        enabled = not silent and (self.deadman is None or self.deadman in self._held)
         values = {
             binding.command: binding.value(self._raw_axes.get(binding.axis, 0.0))
             if enabled
@@ -517,6 +539,7 @@ class JoystickSource(_ThreadSource):
         """Apply one decoded ``js_event`` (public so tests and bridges can feed events)."""
         initial = bool(kind & _JS_INIT)
         kind &= ~_JS_INIT
+        self._last_event = self._clock()
         if kind == _JS_AXIS:
             self._raw_axes[number] = max(-1.0, min(1.0, value / _JS_MAX))
         elif kind == _JS_BUTTON:

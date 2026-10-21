@@ -183,7 +183,8 @@ class OrchestratorPolicy(LLMAgentPolicy):
     comma-separated), ``builtin_motion`` (keep the agent's motion tool, default true),
     ``heartbeat_s`` (call the model with a status update after this long without one
     while jobs run; 0 disables), ``max_wait_s``, ``max_jobs`` (concurrent jobs),
-    ``idle_timeout_s`` and ``api`` (a pre-built ``ExtensionAPI``, for Python callers).
+    ``idle_timeout_s``, ``first_turn_timeout_s`` (how long the first step waits for the
+    model's first decision) and ``api`` (a pre-built ``ExtensionAPI``, for Python callers).
     """
 
     accepts_operator_messages: bool = True
@@ -200,6 +201,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
         max_wait_s: float = 30.0,
         max_jobs: int = 4,
         idle_timeout_s: float = 10.0,
+        first_turn_timeout_s: float = 300.0,
         clock: Callable[[], float] = time.monotonic,
         **agent_kwargs: Any,
     ) -> None:
@@ -220,6 +222,9 @@ class OrchestratorPolicy(LLMAgentPolicy):
             raise ConfigError("max_jobs must be an integer >= 1")
         self._max_jobs = max_jobs
         self._idle_timeout_s = _number(idle_timeout_s, "idle_timeout_s", 0.0, 3600.0)
+        self._first_turn_timeout_s = _number(
+            first_turn_timeout_s, "first_turn_timeout_s", 0.0, 3600.0
+        )
         self._clock = clock
         self._lock = threading.RLock()
         self._wake = threading.Condition(self._lock)
@@ -276,7 +281,9 @@ class OrchestratorPolicy(LLMAgentPolicy):
             policy = self._instances.get(spec.name)
             if policy is None:
                 # Built once, before any robot moves, and reused by every job of the tool.
-                policy = spec.policy if hasattr(spec.policy, "act") else spec.policy()
+                source = spec.policy
+                is_instance = not isinstance(source, type) and hasattr(source, "act")
+                policy = source if is_instance else source()
                 self._instances[spec.name] = policy
             sub_info = sub_embodiment(embodiment_info, dims)
             bind = getattr(policy, "bind", None)
@@ -331,6 +338,8 @@ class OrchestratorPolicy(LLMAgentPolicy):
         self._first_turn = threading.Event()
         self._latest: Observation | None = None
         self._last_act = self._clock()
+        self._in_act = False
+        self._policy_jobs: dict[str, PolicyBehavior] = {}
         self._hold: npt.NDArray[np.float64] | None = None
         self._started_at = self._clock()
         self._stopped_jobs = False
@@ -411,23 +420,42 @@ class OrchestratorPolicy(LLMAgentPolicy):
         )
         with self._lock:
             self._last_act = self._clock()
+            self._in_act = True
             self._latest = snapshot
             self._intake(observation)
             if self._hold is None:
                 self._hold = self._initial_hold(observation)
-            start = self._brain is None and self._finish is None and self._error is None
-            if start:
-                generation = self._generation
+            generation = self._generation
+            first_turn = self._first_turn
+            if self._brain is None and self._finish is None and self._error is None:
+                # The first start of the trial, or a restart after the thread found the
+                # rollout idle (a job's step that took longer than idle_timeout_s).
                 self._brain = threading.Thread(
-                    target=self._think, args=(generation,), name="orchestrator-model", daemon=True
+                    target=self._think,
+                    args=(generation, first_turn),
+                    name="orchestrator-model",
+                    daemon=True,
                 )
                 self._brain.start()
-        if start:
-            # The robot holds until the model's first decision; the wait counts as activity,
-            # so a slow first turn is not mistaken for an ended rollout.
-            while not self._first_turn.wait(0.05):
-                with self._lock:
-                    self._last_act = self._clock()
+        try:
+            return self._act(observation, generation, first_turn)
+        finally:
+            with self._lock:
+                self._in_act = False
+                self._last_act = self._clock()
+
+    def _act(
+        self, observation: Observation, generation: int, first_turn: threading.Event
+    ) -> ActionChunk:
+        # The robot holds until the model's first decision.
+        deadline = self._clock() + self._first_turn_timeout_s
+        while not first_turn.wait(0.05):
+            if self._clock() > deadline:
+                raise RuntimeError(
+                    f"the model made no first decision in {self._first_turn_timeout_s:g}s"
+                )
+        if generation != self._generation:
+            raise RuntimeError("the trial ended while the model was deciding")
         if self._error is not None:
             self._stop_all("the model failed")
             error = self._error
@@ -511,8 +539,13 @@ class OrchestratorPolicy(LLMAgentPolicy):
             clock=self._clock,
         )
         try:
+            previous = self._policy_jobs.get(tool)
+            if previous is not None and previous.busy():
+                raise RuntimeError(f"the previous {tool} inference is still running")
             behavior = factory(context)
             job = Job(behavior, context, max_seconds=max_seconds, monitors=monitors)
+            if isinstance(behavior, PolicyBehavior):
+                self._policy_jobs[tool] = behavior
         except Exception as exc:
             with self._lock:
                 self._release(job_id)
@@ -547,21 +580,24 @@ class OrchestratorPolicy(LLMAgentPolicy):
         assert self._hold is not None
         dim = len(self._labels)
         data = self._hold.copy() if self._absolute else np.zeros(dim)
+        ended: list[tuple[Job, str, str]] = []
         for job in list(self._jobs.values()):
             try:
                 values = job.step(observation, dim)
             except Exception as exc:
-                self._end(job, "failed", f"{type(exc).__name__}: {exc}")
+                ended.append((job, "failed", f"{type(exc).__name__}: {exc}"))
                 continue
             if values is not None:
                 if not np.all(np.isfinite(values)):
-                    self._end(job, "failed", "returned a non-finite action")
+                    ended.append((job, "failed", "returned a non-finite action"))
                     continue
                 data[list(job.context.dims)] = values
             if job.ended is not None:
-                self._end(job, job.ended[0], job.ended[1])
+                ended.append((job, job.ended[0], job.ended[1]))
         if self._absolute:
             self._hold = data.copy()
+        for job, status, text in ended:
+            self._end(job, status, text)
         return data
 
     def _end(self, job: Job, status: str, text: str) -> None:
@@ -569,6 +605,15 @@ class OrchestratorPolicy(LLMAgentPolicy):
             if self._jobs.pop(job.id, None) is None:
                 return
             self._release(job.id)
+            latest = self._latest
+            if self._absolute and self._hold is not None and latest is not None:
+                # Its dims hold where the robot is, not at the job's last target: a
+                # target the approvers were still walking toward would keep the robot
+                # moving after the job stopped.
+                assert self._state_key is not None
+                measured = np.asarray(latest.state[self._state_key], dtype=np.float64)
+                dims = list(job.context.dims)
+                self._hold[dims] = measured[dims]
             for entry in reversed(self._history):
                 if entry["job"] == job.id:
                     entry.update(
@@ -596,7 +641,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
     def _current(self, generation: int) -> bool:
         return generation == self._generation and self._finish is None and self._error is None
 
-    def _think(self, generation: int) -> None:
+    def _think(self, generation: int, first_turn: threading.Event) -> None:
         failures = 0
         resume_now = True
         waiting_until: float | None = None
@@ -608,8 +653,12 @@ class OrchestratorPolicy(LLMAgentPolicy):
                         if not self._current(generation):
                             return
                         now = self._clock()
-                        if now - self._last_act > self._idle_timeout_s:
-                            return  # the rollout stopped calling act(): spend nothing more
+                        if not self._in_act and now - self._last_act > self._idle_timeout_s:
+                            # The rollout stopped calling act(): spend nothing more. The
+                            # next act() starts a new thread if the trial goes on.
+                            if self._brain is threading.current_thread():
+                                self._brain = None
+                            return
                         if resume_now or any(event.wake for event in self._inbox):
                             break
                         if waiting_until is not None and now >= waiting_until:
@@ -625,7 +674,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
                     observation = self._latest
                 resume_now, waiting_until = False, None
                 last_turn = self._clock()
-                outcome = self._turn(generation, events, observation)
+                outcome = self._turn(generation, first_turn, events, observation)
                 if outcome is None:
                     return
                 if outcome == "nudged":
@@ -651,22 +700,27 @@ class OrchestratorPolicy(LLMAgentPolicy):
                 if generation == self._generation:
                     self._error = exc
         finally:
-            self._first_turn.set()
+            first_turn.set()
 
     def _turn(
-        self, generation: int, events: list[JobEvent], observation: Observation | None
+        self,
+        generation: int,
+        first_turn: threading.Event,
+        events: list[JobEvent],
+        observation: Observation | None,
     ) -> str | tuple[str, float | None] | None:
         """One model call and its tool calls. Returns what the thread does next:
         "continue", ("wait", seconds), "jobs" (wait for job events), "nudged", or None
         when the trial is over."""
         if self._calls_used >= self._max_llm_calls:
             with self._lock:
-                self._finish = {
-                    "request_stop": True,
-                    "stop_reason": "give_up",
-                    "stop_detail": "LLM call budget exhausted",
-                }
-            self._first_turn.set()
+                if generation == self._generation:
+                    self._finish = {
+                        "request_stop": True,
+                        "stop_reason": "give_up",
+                        "stop_detail": "LLM call budget exhausted",
+                    }
+            first_turn.set()
             return None
         content = self._message(events, observation)
         with self._lock:
@@ -703,7 +757,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
                         "content": "Respond with tool calls: start a tool, wait, or call done.",
                     }
                 )
-            self._first_turn.set()
+            first_turn.set()
             return "nudged"
         next_step: str | tuple[str, float | None] = "continue"
         frames: tuple[str, ...] = ()
@@ -712,7 +766,10 @@ class OrchestratorPolicy(LLMAgentPolicy):
             if ended:
                 result = "ignored: the trial ends with an earlier call"
             else:
-                result, effect = self._call(call, observation)
+                try:
+                    result, effect = self._call(call, observation, generation)
+                except Exception as exc:  # a tool's bug is the model's error, not the thread's
+                    result, effect = f"{call.name} failed: {type(exc).__name__}: {exc}", None
                 self._echo(f"[orchestrator] {call.name}: {result}")
                 if effect == "end":
                     ended = True
@@ -727,7 +784,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
         if frames and observation is not None:
             with self._lock:
                 self._messages.append({"role": "user", "content": _image_parts(observation)})
-        self._first_turn.set()
+        first_turn.set()
         if ended:
             return None
         return next_step
@@ -761,7 +818,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
         content[0] = {"type": "text", "text": "\n".join(lines) + "\n" + content[0]["text"]}
         return content
 
-    def _call(self, call: Any, observation: Observation | None) -> tuple[str, Any]:
+    def _call(self, call: Any, observation: Observation | None, generation: int) -> tuple[str, Any]:
         """Run one tool call on the model thread: a result for the model and its effect."""
         try:
             arguments = json.loads(call.arguments) if call.arguments else {}
@@ -802,8 +859,18 @@ class OrchestratorPolicy(LLMAgentPolicy):
             if not isinstance(changes, dict) or not changes:
                 return "arguments must be a non-empty object of what to change", None
             with self._lock:
-                if job_id not in self._jobs:
+                job = self._jobs.get(job_id)
+                # A job started earlier in this turn is still queued; queued operations
+                # apply in order, so its steer follows its start.
+                pending = [op[2] for op in self._ops if op[0] == "start" and op[1] == job_id]
+                tool = job.context.tool if job is not None else pending[0] if pending else None
+                if tool is None:
                     return f"no running job {job_id!r}; running: {self._running_ids()}", None
+                spec = self._api.tools.get(tool)
+                if spec is not None:
+                    problem = validate_arguments(spec.parameters, changes, partial=True)
+                    if problem is not None:
+                        return f"steer_job {job_id}: {problem}", None
                 self._ops.append(("steer", job_id, changes))
             return f"steering {job_id}; its reply arrives as an event", "jobs"
         if name == "jobs":
@@ -818,6 +885,8 @@ class OrchestratorPolicy(LLMAgentPolicy):
                 return result.error or "invalid call", None
             meta = dict(result.chunk.actions[0].meta)
             with self._lock:
+                if generation != self._generation:
+                    return "ignored: the trial already ended", "end"
                 self._hindsight = meta.get("stop_hindsight")
                 self._finish = meta
             return result.note, "end"
@@ -888,6 +957,9 @@ class OrchestratorPolicy(LLMAgentPolicy):
         if problem is not None:
             return f"{spec.name}: {problem}", None
         dims = self._tool_dims[spec.name]
+        previous = self._policy_jobs.get(spec.name)
+        if previous is not None and previous.busy():
+            return f"the previous {spec.name} inference is still running; try again shortly", None
         factory: Callable[[JobContext], Any]
         if spec.policy is not None:
             policy = self._bound[spec.name]
@@ -922,11 +994,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
         result = toolset.execute(call, observation)
         if result.error is not None or result.chunk is None:
             return result.error or "invalid motion", None
-        values_key = next(
-            key
-            for key in ("targets", "deltas", "velocities")
-            if isinstance(arguments.get(key), dict)
-        )
+        values_key = toolset.values_key
         index = {label: i for i, label in enumerate(self._labels)}
         dims = tuple(sorted(index[str(label)] for label in arguments[values_key]))
         chunk, target = result.chunk, result.target

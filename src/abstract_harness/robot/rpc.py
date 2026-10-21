@@ -938,6 +938,9 @@ class Controller:
             if not isinstance(name, str) or not NAME.match(name):
                 raise ValueError(f"event {name!r} must match {NAME.pattern}")
         line = json.dumps({"values": values, "events": events_}).encode() + b"\n"
+        if len(line) > select.PIPE_BUF:
+            # Larger writes may interleave or split; a command must arrive whole.
+            raise ValueError(f"command too long ({len(line)} bytes, at most {select.PIPE_BUF})")
         with self._lock:
             if self._commands_fd is None:
                 raise ValueError("no run is active")
@@ -1104,7 +1107,12 @@ class Controller:
         try:
             with self.preview.released():
                 read_fd, write_fd = os.pipe()
-                command_read, command_write = os.pipe()
+                try:
+                    command_read, command_write = os.pipe()
+                except OSError:
+                    os.close(read_fd)
+                    os.close(write_fd)
+                    raise
                 try:
                     reader = EventReader(read_fd, lambda event: self._run_event(run, event))
                     split = argv.index("--")

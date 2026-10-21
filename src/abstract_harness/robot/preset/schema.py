@@ -207,6 +207,8 @@ class ControllerDecl(Record):
     layout: Literal["xbox", "raw"] = "xbox"
     deadman: StrictInt | Name | None = None
     refresh_hz: Annotated[float, Field(gt=0, le=1000)] = 50.0
+    # After this long without any pad event, sticks publish rest (a silent wireless pad).
+    max_silence_s: Annotated[float, Field(gt=0, le=60)] = 1.0
     # Command name -> stick binding.
     axes: dict[Name, AxisBindingDecl] = Field(default_factory=dict)
     # Button (index or layout name) -> an event name, or {event, set}.
@@ -218,7 +220,15 @@ class ControllerDecl(Record):
 
     @model_validator(mode="after")
     def kind_fields(self) -> Self:
-        joystick = {"device", "layout", "deadman", "refresh_hz", "axes", "buttons"}
+        joystick = {
+            "device",
+            "layout",
+            "deadman",
+            "refresh_hz",
+            "max_silence_s",
+            "axes",
+            "buttons",
+        }
         udp = {"host", "port", "allow_remote"}
         wrong = (udp if self.kind == "joystick" else joystick) & self.model_fields_set
         if wrong:
@@ -243,6 +253,10 @@ class RobotSection(Record):
     pace: StrictBool = True
     # Physical drivers only: skip the operator's readiness gates (a notice still prints).
     auto_start: StrictBool = False
+    # Rate modes (base_vel, joint_vel): the watchdog stops the driver when no step arrives
+    # for this long (default [robot.base] command_timeout_s, else 0.25 s); at least two
+    # policy periods.
+    command_timeout_s: Annotated[float, Field(gt=0, le=10)] | None = None
     command_events: list[Name] = Field(default_factory=list)
     joints: JointsSection = Field(default_factory=JointsSection)
     joint: list[JointDecl] = Field(default_factory=list)
@@ -275,7 +289,22 @@ class RobotSection(Record):
             raise ValueError("a preset needs a model file or [[robot.joint]] declarations")
         if self.control_hz is not None and self.control_hz < self.policy_hz:
             raise ValueError("control_hz (the driver's servo rate) must be >= policy_hz")
+        timeout = self.command_timeout
+        if timeout < 2.0 / self.policy_hz:
+            raise ValueError(
+                f"command_timeout_s {timeout:g} is shorter than two policy periods "
+                f"({2.0 / self.policy_hz:g}s): the watchdog would stop the robot between steps"
+            )
         return self
+
+    @property
+    def command_timeout(self) -> float:
+        """The rate-mode watchdog's timeout, in seconds."""
+        if self.command_timeout_s is not None:
+            return self.command_timeout_s
+        if self.base is not None:
+            return self.base.command_timeout_s
+        return 0.25
 
 
 class PresetFile(Record):

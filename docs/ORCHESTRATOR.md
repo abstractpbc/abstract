@@ -107,7 +107,10 @@ steers.
 **Controls.** `controls` lists label globs or `part:<name>` entries, and defaults to every
 dimension. Jobs that drive the same dimensions cannot run at once, so the model must stop
 one before starting the other, in the same turn if it likes. Dimensions no job drives
-hold: the last target for absolute modes, and zero for displacements and velocities.
+hold. For absolute modes, a job's dimensions hold the robot's measured position from
+when the job ended, not its last target, so a stopped job stops the robot. For
+displacements and velocities they hold zero. A policy tool's next job waits until its
+previous job's background inference has returned.
 `max_jobs` caps how many jobs run at once.
 
 ## What the model sees
@@ -141,13 +144,16 @@ A `done` or `give_up` stops every job and ends the trial.
   on one thread.
 - **Guardrails.** Every composed action passes the rollout's approver chain like any
   policy's.
-- **First turn.** The first step of a trial waits for the model's first decision, so the
-  robot holds until then.
+- **First turn.** The first step of a trial waits for the model's first decision, up to
+  `first_turn_timeout_s` (300 s), so the robot holds until then.
 - **Errors.** A model or transport error ends the trial as a policy error, and the robot
   parks.
 - **Idle rollout.** The model thread stops calling the model when `act()` has not been
   called for `idle_timeout_s` (10 s), so a rollout that ended unexpectedly spends nothing
-  more.
+  more. A long-running step does not count as idle, and if the trial resumes, the next
+  `act()` restarts the thread.
+- **Tool errors.** A tool call that raises becomes an error result for the model; steer
+  arguments are checked against the tool's schema.
 - **Pacing.** The orchestrator needs a loop that keeps ticking while the model thinks. It
   declares `requires_paced_loop`, so it gets strict timing automatically on an
   embodiment that does not pace itself ([LIVE_CONTROL.md](LIVE_CONTROL.md)).

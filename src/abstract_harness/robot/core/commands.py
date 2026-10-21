@@ -1429,7 +1429,9 @@ def _announce_timing(
         rate_text = f"{rate:g} Hz" if rate else "the embodiment's rate"
         print(f"timing: strict, {rate_text}{controller}")
     elif SELF_PACED in embodiment.info.capabilities:
-        print(f"timing: the embodiment paces itself{controller}")
+        # The usual case (YAM, presets) says nothing new unless something new is on.
+        if async_inference:
+            print(f"timing: the embodiment paces itself{controller}")
     elif getattr(policy, "requires_paced_loop", False) is True:
         print(f"timing: strict (the policy needs a paced loop){controller}")
     elif not embodiment.info.is_simulated:
@@ -1450,7 +1452,11 @@ def _command_stream(
 ) -> CommandStream | None:
     """The run's live command stream: the embodiment's own (``command_stream()``), with
     the extra sources attached, or a free-form stream when only sources are given."""
-    from abstract_harness.robot.core.command_stream import CommandStream, parse_source
+    from abstract_harness.robot.core.command_stream import (
+        CommandStream,
+        FdCommandSource,
+        parse_source,
+    )
     from abstract_harness.robot.core.errors import ConfigError
 
     hook = getattr(embodiment, "command_stream", None)
@@ -1462,6 +1468,7 @@ def _command_stream(
         )
     if not sources and stream is None:
         return None
+    announce = stream is not None or any(not isinstance(s, FdCommandSource) for s in sources)
     if stream is None:
         stream = CommandStream()
     for source in sources:
@@ -1470,7 +1477,8 @@ def _command_stream(
         except (ConfigError, OSError, ValueError) as exc:
             stream.close()
             raise SystemExit(f"command source {source!r}: {exc}") from exc
-    print(f"{_styled('commands:', _CYAN)} {stream.describe()}")
+    if announce:  # serve's command pipe alone is silent until a client uses it
+        print(f"{_styled('commands:', _CYAN)} {stream.describe()}")
     return stream
 
 

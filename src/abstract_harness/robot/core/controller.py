@@ -228,6 +228,10 @@ class EnsemblingController:
 
 
 _ASYNC_KEY = "_async_controller_trial"
+#: Set by a controller to the step whose observation it just handed the policy. The
+#: rollout then marks that step's approvals, operator messages and command events as
+#: delivered; without it, delivery is assumed at every collected inference.
+_DISPATCH_KEY = "_controller_dispatch_step"
 
 
 @dataclass
@@ -241,14 +245,32 @@ class _AsyncTrial:
     )
     worker: threading.Thread | None = None
     dispatched_at: float | None = None
+    last_dispatch_t: int | None = None
     last: Action | None = None
     last_chunk_len: int = 1
     # A buffered action requested the trial's end: nothing replaces it.
     stop_buffered: bool = False
+    # A stop requested by an action that was dropped as stale, still to be delivered.
+    stop_meta: dict[str, Any] = field(default_factory=dict)
     inferences: int = 0
     holds: int = 0
+    late_actions: int = 0
     stale_actions: int = 0
-    stale_chunks: int = 0
+
+
+def _stop_meta(actions: Any) -> dict[str, Any]:
+    for action in actions:
+        if action.meta.get("request_stop"):
+            return {
+                "request_stop": True,
+                "stop_reason": action.meta.get("stop_reason", "policy_stop"),
+                **(
+                    {"stop_detail": action.meta["stop_detail"]}
+                    if "stop_detail" in action.meta
+                    else {}
+                ),
+            }
+    return {}
 
 
 class AsyncController:
@@ -257,26 +279,32 @@ class AsyncController:
     The first call of a trial runs one inference and waits for it. After that, whenever
     ``prefetch`` or fewer buffered actions remain (an int, or a fraction of the last
     chunk's length), the next inference starts on a worker thread from the current
-    observation while the buffer keeps playing. A chunk computed from the observation
-    of step ``q`` predicts steps ``q, q+1, ...``: when it arrives at step ``t`` its first
-    ``t - q`` actions are already stale and are dropped, and the rest replace whatever
-    is still buffered (the newer prediction wins). A chunk that is entirely stale is
-    discarded and another inference starts at once.
+    observation while the buffer keeps playing; no observation is sent twice. A chunk
+    computed from the observation of step ``q`` predicts steps ``q, q+1, ...``: when it
+    arrives at step ``t`` its first ``t - q`` actions are already stale and are dropped,
+    and the rest replace whatever is still buffered (the newer prediction wins). When the
+    whole chunk is stale (a one-action reactive policy, or latency longer than the
+    chunk), its last action runs at ``t``, one or more steps late, marked
+    ``meta["late"]``.
 
     If the buffer runs dry while inference is still running (an *underrun*), the
     controller holds: an absolute-target action space repeats the last action, any
     other mode (displacements, velocities) sends zeros, so the robot stays where it is.
     ``underrun="wait"`` blocks instead, as ``DefaultController`` would; that is also the
     behavior when the action space declares no semantics. Hold actions carry
-    ``meta["hold"] = True``. An action that requests the trial's end is never replaced
-    by a later prediction.
+    ``meta["hold"] = True``. A stop request is never lost: a buffered one is not
+    replaced by a later prediction, and one on a dropped stale action rides the next
+    action out.
 
     Use it on a paced loop (strict timing or a self-paced embodiment): on an unpaced
-    simulator the loop would spin through hold steps while inference runs. Policies
-    with an ``observe()`` hook (stateful world models that must see every control
-    observation in order) are refused, since ``observe()`` would run concurrently with
-    ``act()``. An inference running longer than ``timeout_s`` raises ``SafetyAbort``.
-    The trial's counts (inferences, holds, stale actions and chunks) land in
+    simulator the loop would spin through hold steps while inference runs. Only
+    ``act()`` runs on the worker, so policies whose ``observe()`` or
+    ``transcript_delta()`` hooks would run concurrently with it (stateful world models,
+    the LLM agent) are refused. An inference running longer than ``timeout_s`` raises
+    ``SafetyAbort``. At the end of a trial the rollout calls ``end_trial``, which waits
+    up to ``join_timeout_s`` for an inference still in flight, so the policy is never
+    reset or read while ``act()`` runs; one that does not return marks the policy
+    abandoned. The trial's counts (inferences, holds, late and stale actions) land in
     ``TrialRecord.metadata["controller"]``.
     """
 
@@ -286,6 +314,7 @@ class AsyncController:
         prefetch: int | float = 0.5,
         underrun: Literal["hold", "wait"] = "hold",
         timeout_s: float = 120.0,
+        join_timeout_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
     ):
         from abstract_harness.robot.core.errors import ConfigError
@@ -298,11 +327,13 @@ class AsyncController:
             raise ConfigError("prefetch must be an int >= 0 or a fraction in (0, 1]")
         if underrun not in ("hold", "wait"):
             raise ConfigError("underrun must be 'hold' or 'wait'")
-        if isinstance(timeout_s, bool) or not math.isfinite(timeout_s) or timeout_s <= 0:
-            raise ConfigError("timeout_s must be finite and positive")
+        for name, value in (("timeout_s", timeout_s), ("join_timeout_s", join_timeout_s)):
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ConfigError(f"{name} must be finite and positive")
         self.prefetch = prefetch
         self.underrun = underrun
         self.timeout_s = float(timeout_s)
+        self.join_timeout_s = float(join_timeout_s)
         self._clock = clock
         self._previous: _AsyncTrial | None = None
 
@@ -316,24 +347,14 @@ class AsyncController:
             store[_ASYNC_KEY] = state
         self._collect(state, t, store, block=False)
         if not state.buffer and state.worker is None and not state.stop_buffered:
-            self._dispatch(policy, observation, t, state)
+            self._dispatch(policy, observation, t, state, store)
         if not state.buffer and state.worker is not None:
             if state.last is None or self._hold_data(policy, state) is None:
                 self._collect(state, t, store, block=True)
-                while not state.buffer and state.worker is None and not state.stop_buffered:
-                    # Every action of that chunk was stale: infer again from this step.
-                    self._dispatch(policy, observation, t, state)
-                    self._collect(state, t, store, block=True)
-        stop_meta: dict[str, Any] = {}
         while state.buffer and state.buffer[0][0] < t:
             _, dropped = state.buffer.popleft()
             state.stale_actions += 1
-            if dropped.meta.get("request_stop"):
-                # Terminal intent is not motion data: it survives a dropped action.
-                stop_meta = {
-                    "request_stop": True,
-                    "stop_reason": dropped.meta.get("stop_reason", "policy_stop"),
-                }
+            state.stop_meta = state.stop_meta or _stop_meta([dropped])
         if state.buffer:
             _, action = state.buffer.popleft()
             state.last = action
@@ -345,32 +366,44 @@ class AsyncController:
                 raise PolicyError(f"policy {policy.info.name!r} left no action to execute")
             action = Action(data=hold, meta={"hold": True})
             state.holds += 1
-        if stop_meta:
-            action = replace(action, meta={**dict(action.meta), **stop_meta})
+        if state.stop_meta:
+            action = replace(action, meta={**dict(action.meta), **state.stop_meta})
+            state.stop_meta = {}
         if (
             state.worker is None
             and not state.stop_buffered
             and len(state.buffer) <= self._threshold(state)
         ):
-            self._dispatch(policy, observation, t, state)
+            self._dispatch(policy, observation, t, state, store)
         store[_REPORT_KEY] = {
             "controller": "async",
             "inferences": state.inferences,
             "holds": state.holds,
+            "late_actions": state.late_actions,
             "stale_actions": state.stale_actions,
-            "stale_chunks": state.stale_chunks,
         }
         return action
+
+    def end_trial(self, store: dict[str, Any]) -> bool:
+        """Wait (bounded) for an inference still in flight; ``False`` when it did not
+        return, so the rollout must not reset or read the policy."""
+        state: _AsyncTrial | None = store.get(_ASYNC_KEY)
+        worker = state.worker if state is not None else None
+        if worker is None:
+            return True
+        worker.join(timeout=self.join_timeout_s)
+        return not worker.is_alive()
 
     def _begin_trial(self, policy: Policy) -> _AsyncTrial:
         from abstract_harness.robot.core.errors import ConfigError, PolicyError
 
-        if callable(getattr(policy, "observe", None)):
-            raise ConfigError(
-                f"AsyncController cannot drive policy {policy.info.name!r}: its observe() "
-                "hook must see every control observation in order, which would run "
-                "concurrently with act(); use DefaultController"
-            )
+        for hook in ("observe", "transcript_delta"):
+            if callable(getattr(policy, hook, None)):
+                raise ConfigError(
+                    f"AsyncController cannot drive policy {policy.info.name!r}: its {hook}() "
+                    "hook would run concurrently with act() on the inference worker; use "
+                    "DefaultController"
+                )
         previous = self._previous
         if previous is not None and previous.worker is not None:
             previous.worker.join(timeout=self.timeout_s)
@@ -401,8 +434,15 @@ class AsyncController:
         return np.zeros_like(last)
 
     def _dispatch(
-        self, policy: Policy, observation: Observation, t: int, state: _AsyncTrial
+        self,
+        policy: Policy,
+        observation: Observation,
+        t: int,
+        state: _AsyncTrial,
+        store: dict[str, Any],
     ) -> None:
+        if state.last_dispatch_t == t:
+            return  # this step's observation already went to the policy
         results = state.result
 
         def run() -> None:
@@ -416,6 +456,8 @@ class AsyncController:
 
         state.worker = threading.Thread(target=run, name="abstract-async-inference", daemon=True)
         state.dispatched_at = self._clock()
+        state.last_dispatch_t = t
+        store[_DISPATCH_KEY] = t
         state.worker.start()
 
     def _collect(self, state: _AsyncTrial, t: int, store: dict[str, Any], *, block: bool) -> None:
@@ -451,17 +493,21 @@ class AsyncController:
         state.inferences += 1
         state.last_chunk_len = len(chunk)
         latency = chunk.inference_latency_s if chunk.inference_latency_s is not None else elapsed
-        fresh = [
-            (query_t + index, action)
-            for index, action in enumerate(chunk.actions)
-            if query_t + index >= t
-        ]
-        store.setdefault(_INFER_KEY, []).append((latency, len(fresh)))
+        actions = list(chunk.actions)
+        fresh = [(query_t + i, a) for i, a in enumerate(actions) if query_t + i >= t]
+        stale = actions[: len(actions) - len(fresh)]
         if not fresh:
-            state.stale_chunks += 1
-            return
+            # All of it is late: its newest action is still the closest prediction to now.
+            last = actions[-1]
+            fresh = [(t, replace(last, meta={**dict(last.meta), "late": True}))]
+            stale = actions[:-1]
+            state.late_actions += 1
+        store.setdefault(_INFER_KEY, []).append((latency, len(fresh)))
+        state.stale_actions += len(stale)
+        state.stop_meta = state.stop_meta or _stop_meta(stale)
         if state.stop_buffered:
             return
-        state.stale_actions += len(chunk) - len(fresh)
         state.buffer = deque(fresh)
-        state.stop_buffered = any(action.meta.get("request_stop") for _, action in fresh)
+        state.stop_buffered = bool(state.stop_meta) or any(
+            action.meta.get("request_stop") for _, action in fresh
+        )
