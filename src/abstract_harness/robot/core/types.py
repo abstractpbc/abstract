@@ -34,8 +34,11 @@ class Observation:
     safety interventions since the previous ``act()`` call), and
     ``extra["operator_messages"]`` (list of
     ``{"t": int, "text": str, "source": str}`` records for live feedback since the
-    previous ``act()`` call) into the policy-facing observation and reserves those keys;
-    embodiments should not set them.
+    previous ``act()`` call) into the policy-facing observation. With a live command
+    stream it also injects ``extra["commands"]`` (``{name: value}``, the latest axis
+    values) and ``extra["command_events"]`` (``{"t", "name", "source"}`` records since the
+    previous ``act()`` call). The rollout reserves those keys; embodiments should not
+    set them.
     """
 
     images: Mapping[str, ImageArray] = field(default_factory=dict)

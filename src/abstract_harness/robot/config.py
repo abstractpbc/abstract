@@ -310,6 +310,13 @@ class RigConfig(Record):
     # Relative paths resolve against the directory of the TOML file.
     log_root: Path = Field(default_factory=default_log_root)
     max_steps: Annotated[int, Field(ge=1, le=6000)] = 1200
+    # Hold every step to the embodiment's control rate (its control_hz, a preset's
+    # policy_hz) and record missed deadlines; `robot run --strict-timing` turns it on.
+    strict_timing: StrictBool = False
+    # With strict_timing: halt (and park) after this many late steps in a row.
+    max_consecutive_overruns: Annotated[int, Field(ge=1, le=100_000)] | None = None
+    # Infer the next action chunk while the current one plays (AsyncController).
+    async_inference: StrictBool = False
 
     @model_validator(mode="after")
     def channels_explicit(self) -> Self:
@@ -320,7 +327,17 @@ class RigConfig(Record):
         ):
             raise ValueError("[rig.embodiment] must set left_channel and right_channel")
         _check_args("rig.embodiment", self.embodiment)
+        if self.max_consecutive_overruns is not None and not self.strict_timing:
+            raise ValueError("[rig] max_consecutive_overruns needs strict_timing = true")
         return self
+
+    def timing(self) -> Any:
+        """The run's ``StrictTiming``, or ``False`` when strict timing is off."""
+        if not self.strict_timing:
+            return False
+        from abstract_harness.robot.core.timing import StrictTiming
+
+        return StrictTiming(max_consecutive_overruns=self.max_consecutive_overruns)
 
 
 class RobotConfig(Record):
@@ -377,6 +394,8 @@ class RobotConfig(Record):
                 "embodiment": self.rig.type,
                 "embodiment_args": self.embodiment_args(),
                 "max_steps": self.rig.max_steps,
+                "strict_timing": self.rig.strict_timing,
+                "async_inference": self.rig.async_inference,
             }
         )
 

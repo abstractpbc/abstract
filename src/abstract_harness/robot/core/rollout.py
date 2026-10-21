@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from abstract_harness.robot.core.approver import Approver
-from abstract_harness.robot.core.controller import _INFER_KEY, Controller
+from abstract_harness.robot.core.command_stream import END_EPISODE
+from abstract_harness.robot.core.controller import _INFER_KEY, _REPORT_KEY, Controller
 from abstract_harness.robot.core.embodiment import Embodiment
 from abstract_harness.robot.core.errors import (
     EmbodimentFault,
@@ -35,6 +36,7 @@ from abstract_harness.robot.core.supervision import InferenceSupervisor
 from abstract_harness.robot.core.transcript import (
     Event,
     approval_event,
+    command_event,
     error_event,
     inference_event,
     operator_event,
@@ -45,12 +47,15 @@ from abstract_harness.robot.core.transcript import (
 from abstract_harness.robot.core.types import OPERATOR_END, Action, Observation, StepResult
 
 if TYPE_CHECKING:
+    from abstract_harness.robot.core.command_stream import CommandStream
     from abstract_harness.robot.core.console import OperatorInput
     from abstract_harness.robot.core.logging.sink import LogSink
+    from abstract_harness.robot.core.timing import Pacer
 
 _TRANSCRIPT_BYTE_LIMIT = 2 * 1024 * 1024
 _APPROVALS_KEY = "_rollout_approvals"
 _OPERATOR_MSGS_KEY = "_rollout_operator_messages"
+_COMMAND_EVENTS_KEY = "_rollout_command_events"
 
 
 class _OperatorStopped(Exception):
@@ -86,6 +91,8 @@ class StepRecord:
     image_refs: Mapping[str, FrameRef] | None = None
     result_image_refs: Mapping[str, FrameRef] | None = None
     requested_action: Action | None = None
+    # The live command values the policy saw at this step (``None`` without a stream).
+    commands: Mapping[str, float] | None = None
 
 
 @dataclass
@@ -272,6 +279,8 @@ def rollout(
     frame_store: FrameStore | None = None,
     operator_input: OperatorInput | None = None,
     policy_timeout_s: float = 120.0,
+    pacer: Pacer | None = None,
+    commands: CommandStream | None = None,
 ) -> TrialRecord:
     """Run a single trial and return its record.
 
@@ -287,11 +296,20 @@ def rollout(
     raised from inside the trial carries the partial ``TrialRecord`` on
     ``exc.record`` for the orchestrator to preserve.
 
-    The loop applies no wall-clock pacing of its own: ``embodiment.step()`` is
-    called as fast as the policy/controller/approver can produce actions. An
-    embodiment that needs real-time cadence paces itself inside ``step()`` and
-    declares the ``"self_paced"`` capability to document that it does (see
-    ``Embodiment``).
+    Without ``pacer`` the loop applies no wall-clock pacing of its own:
+    ``embodiment.step()`` is called as fast as the policy/controller/approver can
+    produce actions. An embodiment that needs real-time cadence paces itself inside
+    ``step()`` and declares the ``"self_paced"`` capability to document that it does
+    (see ``Embodiment``). With a ``Pacer`` (strict timing, ``core/timing.py``) every
+    approved action waits for its tick before dispatch, and the trial's timing report
+    lands in ``record.metadata["timing"]``; a pacer's ``SafetyAbort`` halts like an
+    approver's.
+
+    With a ``CommandStream`` (``core/command_stream.py``) each step injects the live
+    command values as ``extra["commands"]`` and the button events since the previous
+    ``act()`` as ``extra["command_events"]``; events are recorded in the transcript and
+    values with each step. The reserved event ``end_episode`` ends the trial as the
+    console's Esc does.
     """
     if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
         raise ValueError(f"max_steps must be an integer >= 1, got {max_steps!r}")
@@ -341,6 +359,9 @@ def rollout(
             except Exception as exc:
                 raise _record_failure(record, SafetyAbort(str(exc)), -1) from exc
 
+        if commands is not None:
+            commands.begin_trial()
+
         if operator_input is not None:
             try:
                 operator_input.begin_trial()
@@ -376,6 +397,17 @@ def rollout(
                         {"t": t, "text": text, "source": source}
                     )
                     record.events.append(operator_message_event(t, text, source))
+            command_values: dict[str, float] | None = None
+            end_by_command = False
+            if commands is not None:
+                snapshot = commands.snapshot()
+                command_values = dict(snapshot.values)
+                for event in snapshot.events:
+                    store.setdefault(_COMMAND_EVENTS_KEY, []).append(
+                        {"t": t, "name": event.name, "source": event.source}
+                    )
+                    record.events.append(command_event(t, event.name, event.source))
+                    end_by_command = end_by_command or event.name == END_EPISODE
 
             prev_inferences = len(store.get(_INFER_KEY, []))
             all_approvals = store.get(_APPROVALS_KEY, [])
@@ -386,6 +418,16 @@ def rollout(
             tail_operator_msgs = [
                 dict(message) for message in all_operator_msgs[last_operator_msgs_idx:]
             ]
+            all_command_events = store.get(_COMMAND_EVENTS_KEY, [])
+            last_command_events_idx = store.get("_rollout_last_command_events_idx", 0)
+            tail_command_events = [
+                dict(event) for event in all_command_events[last_command_events_idx:]
+            ]
+
+            if end_by_command:
+                record.terminated = True
+                record.termination_reason = OPERATOR_END
+                break
 
             if poll is not None and poll.end is not None:
                 record.terminated = True
@@ -407,6 +449,9 @@ def rollout(
                 policy_extra = {**obs.extra, "env_step": t, "approvals": tail_approvals}
                 if operator_input is not None:
                     policy_extra["operator_messages"] = tail_operator_msgs
+                if command_values is not None:
+                    policy_extra["commands"] = command_values
+                    policy_extra["command_events"] = tail_command_events
                 obs_with_extra = replace(
                     obs,
                     extra=policy_extra,
@@ -419,6 +464,10 @@ def rollout(
                     health = getattr(embodiment, "check_health", None)
                     if callable(health):
                         health()
+                    if commands is not None and commands.end_requested():
+                        record.terminated = True
+                        record.termination_reason = OPERATOR_END
+                        raise _OperatorStopped
                     if operator_input is not None and console_enabled:
                         waiting = operator_input.poll()
                         for i, text in enumerate(waiting.messages):
@@ -467,6 +516,8 @@ def rollout(
                 store["_rollout_last_approvals_idx"] = len(all_approvals)
                 if operator_input is not None:
                     store["_rollout_last_operator_msgs_idx"] = len(all_operator_msgs)
+                if commands is not None:
+                    store["_rollout_last_command_events_idx"] = len(all_command_events)
                 latency, chunk_len = inferences[-1]
                 record.events.append(inference_event(t, latency, chunk_len))
                 if stream_ok:
@@ -559,6 +610,12 @@ def rollout(
                 if refs
                 else obs_rec
             )
+            if pacer is not None:
+                try:
+                    pacer.wait()
+                except RobotError as exc:
+                    _record_failure(record, exc, t)
+                    raise
             try:
                 result: StepResult = embodiment.step(action)
             except RobotError as exc:
@@ -585,6 +642,7 @@ def rollout(
                     image_refs=refs,
                     result_image_refs=result_refs,
                     requested_action=requested_action,
+                    commands=command_values,
                 )
             )
             record.events.append(
@@ -627,6 +685,11 @@ def rollout(
         record.inference_latencies = [
             lat for lat, _ in store.get(_INFER_KEY, []) if lat is not None
         ]
+        if pacer is not None:
+            record.metadata["timing"] = pacer.report()
+        controller_report = store.get(_REPORT_KEY)
+        if isinstance(controller_report, Mapping):
+            record.metadata["controller"] = dict(controller_report)
         if policy_reset_ok:  # pragma: no branch - false only while an exception unwinds
             record.policy_transcript = _collect_transcript(policy)
     return record

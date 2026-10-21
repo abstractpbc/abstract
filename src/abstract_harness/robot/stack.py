@@ -12,7 +12,7 @@ import io
 import os
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -113,11 +113,13 @@ def episode(
     store_frames: bool = True,
     rerun_save: bool = True,
     grade: bool = True,
+    command_sources: Sequence[Any] = (),
 ) -> int:
     """One episode of ``instruction``: the config's policy on ``config.rig.type`` (or
     ``embodiment``, which then gets only ``embodiment_args``), with ``env`` set for its
     duration. The operator's ``policy_args`` and ``embodiment_args`` come last and win.
-    ``source`` names the config in the run header.
+    ``source`` names the config in the run header. ``command_sources`` stream live
+    commands into the policy (``core/command_stream.py``).
     """
     from abstract_harness.robot.core import commands
 
@@ -141,6 +143,9 @@ def episode(
                 store_frames=store_frames,
                 rerun_save=rerun_save,
                 grade=grade,
+                strict_timing=config.rig.timing(),
+                async_inference=config.rig.async_inference,
+                command_sources=command_sources,
             )
         except KeyboardInterrupt:
             code = 130
