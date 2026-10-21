@@ -481,3 +481,51 @@ def test_end_episode_ends_the_trial_even_when_the_queue_dropped_it() -> None:
     )
     assert stream.dropped_events > 0
     assert record.termination_reason == OPERATOR_END and len(record.steps) == 1
+
+
+def test_a_steadily_held_stick_keeps_its_value_by_default() -> None:
+    clock = Clock()
+    stream = CommandStream([AxisSpec("vx", timeout_s=None)], clock=clock)
+    pad = JoystickSource(axes=[AxisBinding("vx", axis=1)], clock=clock)
+    pad.handle(stream, 32767, 0x02, 1)  # full deflection, then no more events
+    clock.now = 30.0
+    pad._publish(stream)
+    assert stream.peek()["vx"] == pytest.approx(1.0)
+
+
+def test_operator_feedback_typed_during_inference_reaches_the_next_act() -> None:
+    from abstract_harness.robot.core.console import ConsolePoll
+
+    seen: list[list[str]] = []
+
+    class Console:
+        polls = 0
+
+        def begin_trial(self) -> None:
+            return None
+
+        def poll(self) -> ConsolePoll:
+            Console.polls += 1
+            return ConsolePoll(messages=("left a bit",)) if Console.polls == 3 else ConsolePoll()
+
+    class Listening(CommandPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            seen.append([m["text"] for m in observation.extra["operator_messages"]])
+            time.sleep(0.2)  # the console is polled while this runs
+            return ActionChunk(actions=[Action(data=np.zeros(2))])
+
+    cube = CubePickEmbodiment()
+    cube.info = replace(cube.info, is_simulated=False)
+    rollout(
+        Listening(),  # type: ignore[arg-type]
+        cube,
+        Scene(id="s", instruction="x", init_seed=0),
+        max_steps=3,
+        seed=0,
+        epoch=0,
+        controller=DefaultController(),
+        approver=AutoApprover(),
+        sink=NullSink(),
+        operator_input=Console(),  # type: ignore[arg-type]
+    )
+    assert ["left a bit"] in seen

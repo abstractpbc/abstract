@@ -80,7 +80,10 @@ actuator: `name`, `type` (`revolute`, `prismatic` or `continuous`), `lower`, `up
 For `joint_vel`, limits come from each joint's velocity limit. In `joint_delta` and
 `joint_vel` modes, a command that would carry a joint past the model's position limits is
 shortened to stop at the limit. It is never reversed, so a joint already past a limit can
-only move back in. MJCF hinge ranges are read
+only move back in. The check reads the joint just before each command. A delta is taken
+relative to the measured position, so a driver must apply it there. A velocity is
+assumed to persist until the watchdog would stop it (`command_timeout_s`), so joints
+slow down near their limits. MJCF hinge ranges are read
 in degrees unless `<compiler angle="radian">`. Joint `<default>` classes, `<include>`
 files, every `<worldbody>` and `<actuator>` section, and `<frame>` groups are followed. An
 actuator that drives a tendon or a site, not a joint, makes the default selection refuse
@@ -174,6 +177,7 @@ kind = "joystick"            # Linux joystick API, /dev/input/js*
 device = "/dev/input/js0"
 layout = "xbox"              # names for buttons and axes; "raw" for indices only
 deadman = "lb"               # sticks count only while held
+# max_silence_s = 1.0        # opt-in: rest after 1 s with no pad event (a dead wireless link)
 
 [robot.controllers.axes]     # command = stick
 vx = { axis = "ly", scale = -1.0, deadzone = 0.05 }

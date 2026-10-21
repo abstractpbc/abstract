@@ -33,7 +33,9 @@ eval(task, policy, robot, strict_timing=StrictTiming(hz=50, max_consecutive_over
 Step `k` of a trial is dispatched no earlier than `start + k / hz`. A step that misses its
 deadline by more than a tenth of a period is an overrun. The schedule never bursts to
 catch up: a late step restarts the schedule at that step, so the next step still waits
-a full period, and the skipped ticks are counted. Each trial's report lands in its metadata under `timing`:
+a full period, and the skipped ticks are counted. Only a step that had time to spare ends a run of consecutive
+overruns, so a loop slightly too slow on every step still reaches the abort limit. Each
+trial's report lands in its metadata under `timing`:
 `hz`, `ticks`, `overruns`, `missed_ticks`, `max_late_ms`, `mean_overrun_late_ms` and
 `effective_hz`.
 
@@ -68,9 +70,9 @@ delivered at the step whose observation went to the policy, so none are lost whi
 inference runs. Only `act()` runs on the worker. Policies whose `observe()` or
 `transcript_delta()` hooks would run concurrently with it are refused: stateful world
 models that must see every control observation in order, and the LLM agent. At a
-trial's end, the rollout waits up to `join_timeout_s` (2 s) for an inference still in
-flight before resetting or reading the policy; one that does not return marks the policy
-abandoned. Use async inference on a paced loop. On an unpaced
+trial's end, the rollout waits for an inference still in flight, until that inference's
+own deadline, before reading the policy. Before the next trial's `reset()`, it refuses to
+start while one is still running. One that never returns marks the policy abandoned. Use async inference on a paced loop. On an unpaced
 simulator, the loop spins through hold steps while inference runs.
 
 ## Live commands
@@ -112,8 +114,10 @@ Sources:
 
 A gamepad reports only changes, so the joystick source republishes held stick values
 (50 Hz by default) to keep them inside their axes' timeouts. A pad that disconnects stops
-republishing, and its axes return to rest. So does a wireless pad that goes silent with
-its device still open, after `max_silence_s` (1 s) without any event.
+republishing, and its axes return to rest. A wireless pad can also go silent with its
+device still open. With `max_silence_s` set, its axes return to rest after that long
+without any event. This is opt-in, because a stick held still at full deflection sends no
+events either; pair it with a deadman button.
 
 ## Teleop
 

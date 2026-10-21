@@ -119,7 +119,7 @@ class PresetEmbodiment(EmbodimentBase):
         self._home_confirmed = False
         self._fault: str | None = None
         self._rested = False
-        self._last_joint_pos: npt.NDArray[np.float64] | None = None
+        self._accel_limited = False
 
     # -- optional hooks ------------------------------------------------------------
 
@@ -144,6 +144,7 @@ class PresetEmbodiment(EmbodimentBase):
             for index, label in enumerate(self.description.labels)
         ]
         approver = AccelerationLimitApprover(action_space, per_step, rest=self._take_rest)
+        self._accel_limited = True
         return GuardrailContribution(approvers=(("accel-limit", approver),))
 
     def _take_rest(self) -> bool:
@@ -299,10 +300,18 @@ class PresetEmbodiment(EmbodimentBase):
         if self._fault is not None:
             raise EmbodimentFault(self._fault)
         data = np.asarray(action.data, dtype=np.float64).reshape(self.description.dim)
-        data, position_clamped = self._within_position_limits(data)
         if self._pacer is not None:
             self._pacer.wait()
+        position_clamped = False
         with self._lock:
+            if self.description.position_limits is not None:
+                # Read just before commanding: the joint has moved since the last step.
+                fresh = self._state(driver)["joint_pos"]
+                data, position_clamped = self._within_position_limits(data, fresh)
+            if self._rested and self._accel_limited:
+                # The watchdog stopped the base after this action was approved against
+                # the old velocity: send rest now; the next one ramps up from it.
+                data = np.zeros_like(data)
             driver.command(data)
             self._last_command = self._clock()
             self._halted = False
@@ -328,18 +337,19 @@ class PresetEmbodiment(EmbodimentBase):
         )
 
     def _within_position_limits(
-        self, data: npt.NDArray[np.float64]
+        self, data: npt.NDArray[np.float64], measured: npt.NDArray[np.float64]
     ) -> tuple[npt.NDArray[np.float64], bool]:
         """For delta and velocity joint modes: shorten a command that would carry a joint
         past the model's position limits so it stops at the limit. A command is only ever
         shortened, never reversed or enlarged, so a joint already past a limit can move
-        back in but is never pushed."""
+        back in but is never pushed. A delta applies to the measured position; a velocity
+        is assumed to last until the watchdog would stop it (``command_timeout_s``), the
+        longest it can persist without another step."""
         limits = self.description.position_limits
-        measured = self._last_joint_pos
-        if limits is None or measured is None:
+        if limits is None:
             return data, False
         low, high = limits
-        dt = 1.0 if self.description.mode == "joint_delta" else 1.0 / self.description.policy_hz
+        dt = 1.0 if self.description.mode == "joint_delta" else self._rate_timeout
         with np.errstate(invalid="ignore"):
             room_up = np.where(np.isnan(high), np.inf, np.maximum(high - measured, 0.0)) / dt
             room_down = np.where(np.isnan(low), -np.inf, np.minimum(low - measured, 0.0)) / dt
@@ -386,8 +396,6 @@ class PresetEmbodiment(EmbodimentBase):
     def _observe(self, driver: Any, instruction: str | None) -> Observation:
         state = self._state(driver)
         state_time = self._clock()
-        if "joint_pos" in state:
-            self._last_joint_pos = state["joint_pos"].copy()
         images: dict[str, Any] = {}
         image_times: dict[str, float] = {}
         if self.description.cameras:

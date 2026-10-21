@@ -271,16 +271,32 @@ def test_agent_like_policies_are_refused() -> None:
         AsyncController().next_action(policy, _obs(0), 0, {})
 
 
+def test_end_trial_waits_for_a_slow_inference_to_finish() -> None:
+    # A normal slow inference (a remote VLA's few seconds) is waited for, not abandoned.
+    policy = StepPolicy(horizon=2)
+    controller = AsyncController(prefetch=0)
+    store: dict[str, Any] = {}
+    controller.next_action(policy, _obs(0), 0, store)
+    policy.delay_s = 0.5
+    controller.next_action(policy, _obs(1), 1, store)  # dispatches the slow inference
+    started = time.monotonic()
+    assert controller.end_trial(store) is True
+    assert time.monotonic() - started >= 0.3
+
+
 def test_end_trial_waits_for_inference_and_reports_a_stuck_one() -> None:
     policy = StepPolicy(horizon=2)
-    controller = AsyncController(prefetch=0, join_timeout_s=0.1)
+    controller = AsyncController(prefetch=0, timeout_s=0.3)
     store: dict[str, Any] = {}
     controller.next_action(policy, _obs(0), 0, store)
     policy.gate = threading.Event()
     controller.next_action(policy, _obs(1), 1, store)  # dispatches the next inference
-    assert controller.end_trial(store) is False
+    assert controller.end_trial(store) is False  # still running at its deadline
+    with pytest.raises(PolicyError, match="still running past its deadline"):
+        controller.prepare_trial(policy)
     policy.gate.set()
     assert controller.end_trial(store) is True
+    controller.prepare_trial(policy)
 
 
 def test_the_rollout_never_resets_a_policy_under_a_stuck_inference() -> None:
@@ -313,7 +329,7 @@ def test_the_rollout_never_resets_a_policy_under_a_stuck_inference() -> None:
         max_steps=6,
         seed=0,
         epoch=0,
-        controller=AsyncController(prefetch=1, join_timeout_s=0.1),
+        controller=AsyncController(prefetch=1, timeout_s=0.3),
         approver=AutoApprover(),
         sink=NullSink(),
     )
@@ -361,3 +377,52 @@ def test_events_reach_the_policy_once_under_async_inference() -> None:
     # Every press is delivered exactly once, except those after the last dispatch.
     assert seen == sorted(set(seen)) and set(seen) <= set(pressed)
     assert len(seen) >= len(pressed) - 10
+
+
+def test_a_slow_inference_at_trial_end_is_not_abandoned_and_never_overlaps_reset(
+    tmp_path: Any,
+) -> None:
+    from abstract_harness.robot.core import eval
+    from abstract_harness.robot.core.task import Epochs
+
+    running = threading.Event()
+    overlaps: list[str] = []
+
+    class Slow(ScriptedPolicy):
+        resets = 0
+        ended = 0
+
+        def reset(self, scene: Any) -> None:
+            if running.is_set():
+                overlaps.append("reset() while act() runs")
+            Slow.resets += 1
+            super().reset(scene)
+
+        def on_trial_end(self, record: Any, log_dir: str, run_id: str) -> None:
+            Slow.ended += 1
+
+        def act(self, observation: Observation) -> ActionChunk:
+            running.set()
+            try:
+                if self.num_inferences >= 1:
+                    time.sleep(0.4)
+                return super().act(observation)
+            finally:
+                running.clear()
+
+    (log,) = eval(
+        Task(
+            name="slow",
+            scenes=[Scene(id="s0", instruction="reach", init_seed=0)],
+            scorer=success_at_end(),
+            max_steps=3,
+            epochs=Epochs(2),
+        ),
+        Slow(chunk_size=4, max_step=0.001),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+        controller=AsyncController(prefetch=3),
+    )
+    assert overlaps == []
+    assert Slow.resets == 2 and Slow.ended == 2
+    assert not any(meta.get("policy_abandoned") for meta in log.samples[0].trial_metadata)

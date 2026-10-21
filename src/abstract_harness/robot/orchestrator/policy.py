@@ -268,6 +268,18 @@ class OrchestratorPolicy(LLMAgentPolicy):
         assert semantics is not None  # the toolset refuses spaces without semantics
         self._labels = semantics.dim_labels or tuple(str(i) for i in range(space.dim))
         self._absolute = semantics.control_mode in ABSOLUTE_CONTROL_MODES
+        # The per-step limit the default delta limiter enforces: a declared max_step, else
+        # 5% of the range (no limit without bounds).
+        declared = semantics.max_step or (None,) * space.dim
+        span = (
+            np.asarray(space.high, dtype=np.float64) - np.asarray(space.low, dtype=np.float64)
+            if space.low is not None and space.high is not None
+            else np.full(space.dim, np.inf)
+        )
+        self._step_limit = np.array(
+            [step if step is not None else 0.05 * span[i] for i, step in enumerate(declared)],
+            dtype=np.float64,
+        )
         if self._absolute:
             keys = reference_state_keys(
                 embodiment_info.observation_space.state, space.dim, semantics.control_mode
@@ -606,14 +618,24 @@ class OrchestratorPolicy(LLMAgentPolicy):
                 return
             self._release(job.id)
             latest = self._latest
-            if self._absolute and self._hold is not None and latest is not None:
-                # Its dims hold where the robot is, not at the job's last target: a
-                # target the approvers were still walking toward would keep the robot
-                # moving after the job stopped.
+            if (
+                status != "finished"
+                and self._absolute
+                and self._hold is not None
+                and latest is not None
+            ):
+                # A stopped, failed or timed-out job's last target may be far ahead of the
+                # robot, and the approvers would keep walking toward it. Hold at most one
+                # step limit from where the robot is: a moving joint stops, a target it
+                # already reached (a gripper squeezing an object) stays. A job that
+                # finished keeps its final target.
                 assert self._state_key is not None
                 measured = np.asarray(latest.state[self._state_key], dtype=np.float64)
                 dims = list(job.context.dims)
-                self._hold[dims] = measured[dims]
+                reach = self._step_limit[dims]
+                self._hold[dims] = np.clip(
+                    self._hold[dims], measured[dims] - reach, measured[dims] + reach
+                )
             for entry in reversed(self._history):
                 if entry["job"] == job.id:
                     entry.update(

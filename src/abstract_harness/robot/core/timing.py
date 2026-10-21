@@ -148,6 +148,7 @@ class Pacer:
         Raises ``SafetyAbort`` once ``max_consecutive_overruns`` steps in a row were late.
         """
         now = self._clock()
+        slack = True
         if self._anchor is None:
             self._anchor = now
             self._k = 0
@@ -155,6 +156,7 @@ class Pacer:
         else:
             self._k += 1
             deadline = self._anchor + self._k * self.period_s
+            slack = now <= deadline
             if now < deadline:
                 self._sleep(deadline - now)
                 now = self._clock()
@@ -181,7 +183,9 @@ class Pacer:
                     f"their {self.hz:g} Hz deadline (last {late * 1000:.1f} ms late); "
                     "evaluation halted"
                 )
-        else:
+        elif slack:
+            # Only a step that had time to spare ends a run of overruns: one that is a
+            # little late (within the tolerance) is not keeping the rate either.
             self.consecutive_overruns = 0
         return late
 

@@ -356,7 +356,11 @@ def test_the_g1_template_resolves_against_a_g1_model(tmp_path: Path) -> None:
 def test_the_watchdog_timeout_must_cover_two_policy_periods(tmp_path: Path) -> None:
     with pytest.raises(PresetError, match="shorter than two policy periods"):
         load_preset(
-            write(tmp_path, 'command_timeout_s = 0.05\n[robot.joints]\nselect = ["arm_j1"]\n')
+            write(
+                tmp_path,
+                'mode = "joint_vel"\ncommand_timeout_s = 0.05\n'
+                '[robot.joints]\nselect = ["arm_j1"]\n',
+            )
         )
     description = load_preset(
         write(

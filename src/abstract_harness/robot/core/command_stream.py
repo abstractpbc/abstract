@@ -483,9 +483,12 @@ class JoystickSource(_ThreadSource):
     (``ButtonBinding``). The pad reports only changes, so held stick values are
     republished at ``refresh_hz`` to stay inside their axes' deadman timeouts; a pad
     that disconnects stops republishing and its axes fall back to rest. A wireless pad
-    can also go silent with its device still open (out of range, flat battery): after
-    ``max_silence_s`` without any event, the sticks publish rest until the pad speaks
-    again. With a ``deadman`` button, sticks count only while it is held.
+    can also go silent with its device still open (out of range, flat battery): with
+    ``max_silence_s`` set, after that long without any event, the sticks publish rest
+    until the pad speaks
+    again. That cutoff is opt-in, because the joystick API reports only changes: a stick
+    held still at full deflection sends no events either. With a ``deadman`` button,
+    sticks count only while it is held.
     """
 
     name = "joystick"
@@ -498,15 +501,15 @@ class JoystickSource(_ThreadSource):
         buttons: Sequence[ButtonBinding] = (),
         deadman: int | None = None,
         refresh_hz: float = 50.0,
-        max_silence_s: float = 1.0,
+        max_silence_s: float | None = None,
         source: str = "joystick",
         opener: Callable[[str], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
-        if isinstance(max_silence_s, bool) or not max_silence_s > 0:
-            raise ConfigError("max_silence_s must be positive")
-        self.max_silence_s = float(max_silence_s)
+        if max_silence_s is not None and (isinstance(max_silence_s, bool) or not max_silence_s > 0):
+            raise ConfigError("max_silence_s must be positive or None")
+        self.max_silence_s = None if max_silence_s is None else float(max_silence_s)
         self._clock = clock
         self._last_event: float | None = None
         self.device = device
@@ -521,7 +524,9 @@ class JoystickSource(_ThreadSource):
         self.connected = False
 
     def _publish(self, stream: CommandStream) -> None:
-        silent = self._last_event is None or self._clock() - self._last_event > self.max_silence_s
+        silent = self._last_event is None or (
+            self.max_silence_s is not None and self._clock() - self._last_event > self.max_silence_s
+        )
         enabled = not silent and (self.deadman is None or self.deadman in self._held)
         values = {
             binding.command: binding.value(self._raw_axes.get(binding.axis, 0.0))

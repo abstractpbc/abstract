@@ -319,10 +319,10 @@ class PolicyBehavior:
         return "now " + ", ".join(changed)
 
     def stop(self) -> None:
-        """Wait (bounded) for an inference the controller still runs in the background."""
-        end_trial = getattr(self.controller, "end_trial", None)
-        if callable(end_trial):
-            end_trial(self._store)
+        """Nothing to wait for here: an inference still in the background finishes on its
+        own, and ``busy()`` keeps the policy from another job until it does. Stopping
+        never stalls the control loop."""
+        return None
 
     def busy(self) -> bool:
         """Whether an inference of this job is still running on a controller worker, so

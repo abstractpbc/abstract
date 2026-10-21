@@ -107,9 +107,11 @@ steers.
 **Controls.** `controls` lists label globs or `part:<name>` entries, and defaults to every
 dimension. Jobs that drive the same dimensions cannot run at once, so the model must stop
 one before starting the other, in the same turn if it likes. Dimensions no job drives
-hold. For absolute modes, a job's dimensions hold the robot's measured position from
-when the job ended, not its last target, so a stopped job stops the robot. For
-displacements and velocities they hold zero. A policy tool's next job waits until its
+hold. For absolute modes, a finished job's dimensions keep its final target, so a gripper
+that closed on an object keeps squeezing. A stopped, failed or timed-out job's
+dimensions hold within one step limit of the robot's measured position, so the robot
+stops instead of walking on toward a far target. For displacements and velocities they
+hold zero. A policy tool's next job waits until its
 previous job's background inference has returned.
 `max_jobs` caps how many jobs run at once.
 

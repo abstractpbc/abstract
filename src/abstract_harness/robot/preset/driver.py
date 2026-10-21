@@ -14,7 +14,8 @@ open hardware: ``connect()`` does. The methods:
     The current state: every field the preset declares in ``[robot.state]``, joint fields
     in action order (``description.joint_names``).
 ``command(values)``
-    Send one action, in the preset's mode and dimension order.
+    Send one action, in the preset's mode and dimension order. A ``joint_delta`` action
+    applies to the measured position (the embodiment limits it against that reading).
 ``stop()``
     Bring the robot to rest now (zero velocity, hold position, or damp, as the robot
     requires). Called by the watchdog, on a fall, on close and after errors; must be

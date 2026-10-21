@@ -301,11 +301,13 @@ class AsyncController:
     ``act()`` runs on the worker, so policies whose ``observe()`` or
     ``transcript_delta()`` hooks would run concurrently with it (stateful world models,
     the LLM agent) are refused. An inference running longer than ``timeout_s`` raises
-    ``SafetyAbort``. At the end of a trial the rollout calls ``end_trial``, which waits
-    up to ``join_timeout_s`` for an inference still in flight, so the policy is never
-    reset or read while ``act()`` runs; one that does not return marks the policy
-    abandoned. The trial's counts (inferences, holds, late and stale actions) land in
-    ``TrialRecord.metadata["controller"]``.
+    ``SafetyAbort``. The policy is never read or reset while ``act()`` runs: at the end
+    of a trial the rollout calls ``end_trial``, which waits for an inference still in
+    flight until that inference's own deadline (``timeout_s`` from its dispatch), and
+    one that never returns marks the policy abandoned; before the next trial's
+    ``policy.reset()`` it calls ``prepare_trial``, which refuses (``PolicyError``) while
+    a previous inference still runs. The trial's counts (inferences, holds, late and
+    stale actions) land in ``TrialRecord.metadata["controller"]``.
     """
 
     def __init__(
@@ -314,7 +316,6 @@ class AsyncController:
         prefetch: int | float = 0.5,
         underrun: Literal["hold", "wait"] = "hold",
         timeout_s: float = 120.0,
-        join_timeout_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
     ):
         from abstract_harness.robot.core.errors import ConfigError
@@ -327,13 +328,11 @@ class AsyncController:
             raise ConfigError("prefetch must be an int >= 0 or a fraction in (0, 1]")
         if underrun not in ("hold", "wait"):
             raise ConfigError("underrun must be 'hold' or 'wait'")
-        for name, value in (("timeout_s", timeout_s), ("join_timeout_s", join_timeout_s)):
-            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
-                raise ConfigError(f"{name} must be finite and positive")
+        if isinstance(timeout_s, bool) or not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ConfigError("timeout_s must be finite and positive")
         self.prefetch = prefetch
         self.underrun = underrun
         self.timeout_s = float(timeout_s)
-        self.join_timeout_s = float(join_timeout_s)
         self._clock = clock
         self._previous: _AsyncTrial | None = None
 
@@ -385,16 +384,14 @@ class AsyncController:
         return action
 
     def end_trial(self, store: dict[str, Any]) -> bool:
-        """Wait (bounded) for an inference still in flight; ``False`` when it did not
-        return, so the rollout must not reset or read the policy."""
+        """Wait for an inference still in flight, until its own deadline; ``False`` when
+        it did not return, so the rollout must not reset or read the policy."""
         state: _AsyncTrial | None = store.get(_ASYNC_KEY)
-        worker = state.worker if state is not None else None
-        if worker is None:
-            return True
-        worker.join(timeout=self.join_timeout_s)
-        return not worker.is_alive()
+        return self._settle(state)
 
-    def _begin_trial(self, policy: Policy) -> _AsyncTrial:
+    def prepare_trial(self, policy: Policy) -> None:
+        """Before the rollout resets ``policy``: refuse a policy this controller cannot
+        drive, and one whose previous inference is still running."""
         from abstract_harness.robot.core.errors import ConfigError, PolicyError
 
         for hook in ("observe", "transcript_delta"):
@@ -404,14 +401,23 @@ class AsyncController:
                     "hook would run concurrently with act() on the inference worker; use "
                     "DefaultController"
                 )
-        previous = self._previous
-        if previous is not None and previous.worker is not None:
-            previous.worker.join(timeout=self.timeout_s)
-            if previous.worker.is_alive():
-                raise PolicyError(
-                    "the previous trial's inference is still running; this policy cannot "
-                    "be reused until it returns"
-                )
+        if not self._settle(self._previous):
+            raise PolicyError(
+                "the previous trial's inference is still running past its deadline; this "
+                "policy cannot be reused until it returns"
+            )
+
+    def _settle(self, state: _AsyncTrial | None) -> bool:
+        worker = state.worker if state is not None else None
+        if state is None or worker is None:
+            return True
+        started = state.dispatched_at if state.dispatched_at is not None else self._clock()
+        # Past its deadline it still gets a moment to finish returning.
+        worker.join(timeout=max(0.05, self.timeout_s - (self._clock() - started)))
+        return not worker.is_alive()
+
+    def _begin_trial(self, policy: Policy) -> _AsyncTrial:
+        self.prepare_trial(policy)  # again, for callers that drive next_action directly
         state = _AsyncTrial()
         self._previous = state
         return state

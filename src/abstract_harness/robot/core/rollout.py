@@ -333,6 +333,11 @@ def rollout(
     try:
         t = -1
         try:
+            prepare = getattr(controller, "prepare_trial", None)
+            if callable(prepare):
+                # A controller that infers in the background confirms first that no
+                # earlier act() still runs: reset() must never overlap it.
+                prepare(policy)
             policy.reset(scene)
             policy_reset_ok = True
         except RobotError as exc:
@@ -425,6 +430,9 @@ def rollout(
             tail_operator_msgs = [
                 dict(message) for message in all_operator_msgs[last_operator_msgs_idx:]
             ]
+            # Delivered up to what the tail held: messages typed while this step's
+            # inference runs are appended later and reach the next act().
+            operator_msgs_built = len(all_operator_msgs)
             all_command_events = store.get(_COMMAND_EVENTS_KEY, [])
             last_command_events_idx = store.get("_rollout_last_command_events_idx", 0)
             tail_command_events = [
@@ -531,7 +539,7 @@ def rollout(
             if delivered:
                 store["_rollout_last_approvals_idx"] = len(all_approvals)
                 if operator_input is not None:
-                    store["_rollout_last_operator_msgs_idx"] = len(all_operator_msgs)
+                    store["_rollout_last_operator_msgs_idx"] = operator_msgs_built
                 if commands is not None:
                     store["_rollout_last_command_events_idx"] = len(all_command_events)
             if len(inferences) > prev_inferences:
@@ -715,6 +723,6 @@ def rollout(
         controller_report = store.get(_REPORT_KEY)
         if isinstance(controller_report, Mapping):
             record.metadata["controller"] = dict(controller_report)
-        if policy_reset_ok:  # pragma: no branch - false only while an exception unwinds
+        if policy_reset_ok:  # false while an exception unwinds or an inference was abandoned
             record.policy_transcript = _collect_transcript(policy)
     return record

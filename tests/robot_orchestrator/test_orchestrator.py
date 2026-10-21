@@ -595,3 +595,29 @@ def test_the_first_decision_has_a_deadline() -> None:
     with pytest.raises(RuntimeError, match="no first decision in 0.2s"):
         policy.act(cube.reset(Scene(id="s", instruction="x")))
     policy._shutdown()
+
+
+def test_a_finished_job_keeps_its_final_target() -> None:
+    class Close:
+        def __init__(self, ctx: Any) -> None:
+            self.ctx = ctx
+
+        def step(self, observation: Any) -> list[float]:
+            self.ctx.finish("closed")  # e.g. a gripper squeezing an object: keep squeezing
+            return [-1.5]
+
+    api = ExtensionAPI()
+    api.register_tool(name="close", description="close", start=Close, controls=["a"])
+
+    def decide(history: str, n: int) -> Calls:
+        return [("close", {})] if n == 1 else [("wait", {})]
+
+    policy = orchestrator(FakeModel(decide), api=api)
+    policy.bind(_arm())
+    policy.reset(Scene(id="s", instruction="close"))
+    trace = _drive_policy(
+        policy, 50, lambda: any(e["status"] == "finished" for e in policy._history)
+    )
+    trace += _drive_policy(policy, 5, lambda: False)
+    policy._shutdown()
+    assert all(target[0] == pytest.approx(-1.5) for target, _ in trace[-5:])

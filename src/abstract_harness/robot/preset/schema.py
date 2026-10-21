@@ -207,8 +207,10 @@ class ControllerDecl(Record):
     layout: Literal["xbox", "raw"] = "xbox"
     deadman: StrictInt | Name | None = None
     refresh_hz: Annotated[float, Field(gt=0, le=1000)] = 50.0
-    # After this long without any pad event, sticks publish rest (a silent wireless pad).
-    max_silence_s: Annotated[float, Field(gt=0, le=60)] = 1.0
+    # Opt-in: after this long without any pad event, sticks publish rest (a wireless pad
+    # gone silent). A stick held still sends no events either, so leave it off for
+    # sustained full-deflection driving.
+    max_silence_s: Annotated[float, Field(gt=0, le=60)] | None = None
     # Command name -> stick binding.
     axes: dict[Name, AxisBindingDecl] = Field(default_factory=dict)
     # Button (index or layout name) -> an event name, or {event, set}.
@@ -255,7 +257,7 @@ class RobotSection(Record):
     auto_start: StrictBool = False
     # Rate modes (base_vel, joint_vel): the watchdog stops the driver when no step arrives
     # for this long (default [robot.base] command_timeout_s, else 0.25 s); at least two
-    # policy periods.
+    # policy periods. joint_vel also limits approach speed near position limits by it.
     command_timeout_s: Annotated[float, Field(gt=0, le=10)] | None = None
     command_events: list[Name] = Field(default_factory=list)
     joints: JointsSection = Field(default_factory=JointsSection)
@@ -290,7 +292,7 @@ class RobotSection(Record):
         if self.control_hz is not None and self.control_hz < self.policy_hz:
             raise ValueError("control_hz (the driver's servo rate) must be >= policy_hz")
         timeout = self.command_timeout
-        if timeout < 2.0 / self.policy_hz:
+        if self.mode in ("base_vel", "joint_vel") and timeout < 2.0 / self.policy_hz:
             raise ValueError(
                 f"command_timeout_s {timeout:g} is shorter than two policy periods "
                 f"({2.0 / self.policy_hz:g}s): the watchdog would stop the robot between steps"

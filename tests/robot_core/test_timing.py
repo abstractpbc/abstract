@@ -294,3 +294,14 @@ def test_cli_eval_takes_strict_timing_and_async_inference(tmp_path: Any, capsys:
     assert exit_info.value.code == 0
     out = capsys.readouterr().out
     assert "timing: strict, 10 Hz with async inference" in out
+
+
+def test_a_loop_slightly_too_slow_every_step_still_aborts() -> None:
+    # 21.5 ms of work per 20 ms step: late by less than the tolerance on alternate steps.
+    clock = FakeClock()
+    pacer = Pacer(50, max_consecutive_overruns=3, clock=clock, sleep=clock.sleep)
+    with pytest.raises(SafetyAbort, match="3 consecutive steps missed"):
+        for _ in range(500):
+            pacer.wait()
+            clock.now += 0.0215
+    assert pacer.ticks < 20

@@ -512,3 +512,45 @@ def test_a_driver_that_fails_to_connect_is_closed(
     with pytest.raises(OSError, match="no such device"):
         arm.reset(SCENE)
     assert FakeRobot.calls[-1] == "close" and arm._driver is None
+
+
+def test_velocity_near_a_position_limit_is_slowed_to_stop_by_the_watchdog_horizon(
+    tmp_path: Path,
+) -> None:
+    shutil.copy(ARM.parent / "mobile_manipulator.urdf", tmp_path)
+    (tmp_path / "vel.toml").write_text(
+        '[robot]\nname = "vel"\nmodel = "mobile_manipulator.urdf"\npolicy_hz = 20\n'
+        'mode = "joint_vel"\ncommand_timeout_s = 0.25\n[robot.joints]\nselect = ["arm_j1"]\n'
+    )
+    arm = PresetEmbodiment(str(tmp_path / "vel.toml"), pace=False)
+    arm.reset(SCENE)
+    arm._driver.position[:] = 2.8  # 0.1 rad from the 2.9 limit
+    result = arm.step(Action(data=np.array([2.0])))
+    # Even if this velocity persisted until the watchdog fired, it would stop at the limit.
+    assert result.command["joint_vel"][0] == pytest.approx(0.1 / 0.25)
+    assert result.info["position_clamped"] is True
+    arm.close()
+
+
+def test_low_rate_position_presets_load_with_the_default_timeout(tmp_path: Path) -> None:
+    shutil.copy(ARM.parent / "mobile_manipulator.urdf", tmp_path)
+    (tmp_path / "slow.toml").write_text(
+        '[robot]\nname = "slow"\nmodel = "mobile_manipulator.urdf"\npolicy_hz = 5\n'
+        '[robot.joints]\nselect = ["arm_j1"]\n'
+    )
+    assert PresetEmbodiment(str(tmp_path / "slow.toml")).info.control_hz == 5.0
+
+
+def test_an_action_approved_before_a_watchdog_stop_goes_out_as_rest() -> None:
+    base = PresetEmbodiment(str(BASE), pace=False)
+    approver, _, _ = build_guardrails(base.info.action_space, None, base)
+    store: dict[str, Any] = {}
+    approver.begin_trial(None, store)
+    base.reset(SCENE)
+    approved = approver.review(Action(data=np.array([1.0, 0.0])), store)
+    base._rested = True  # the watchdog fired between review and step
+    result = base.step(approved)
+    np.testing.assert_array_equal(result.command["base_vel"], [0.0, 0.0])
+    resumed = approver.review(Action(data=np.array([1.0, 0.0])), store)
+    assert resumed.data[0] == pytest.approx(0.02)  # from rest again
+    base.close()
