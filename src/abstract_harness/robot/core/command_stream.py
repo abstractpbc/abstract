@@ -66,6 +66,23 @@ def _number(value: object, what: str) -> float:
     return number
 
 
+def parse_message(message: Mapping[str, Any]) -> tuple[dict[str, float], list[str]]:
+    """A wire message's values and events, checked: ``{"values": {...}, "events": [...]}``,
+    or a flat ``{"vx": 0.3}`` of values. Raises ``ValueError``."""
+    if "values" in message or "events" in message:
+        values = message.get("values") or {}
+        events = message.get("events") or []
+        if not isinstance(values, Mapping) or not isinstance(events, list):
+            raise ValueError("values must be an object and events a list")
+    else:
+        values, events = message, []
+    checked = {
+        _name(name, "command name"): _number(value, f"value for {name!r}")
+        for name, value in values.items()
+    }
+    return checked, [_name(event, "event") for event in events]
+
+
 @dataclass(frozen=True)
 class AxisSpec:
     """One continuous command: its range, resting value and deadman timeout.
@@ -114,8 +131,10 @@ class CommandSnapshot:
     """What one step reads: every live axis value and the events drained since the
     previous snapshot."""
 
-    values: Mapping[str, float] = field(default_factory=dict)
+    values: dict[str, float] = field(default_factory=dict)
     events: tuple[CommandEvent, ...] = ()
+    # end_episode arrived during this trial, even if its event was dropped from a full queue.
+    end: bool = False
 
 
 class CommandSource(Protocol):
@@ -207,13 +226,7 @@ class CommandStream:
         """One message from a wire source: ``{"values": {...}, "events": [...]}``, or a
         flat ``{"vx": 0.3}`` of values. Invalid messages are counted and skipped."""
         try:
-            if "values" in message or "events" in message:
-                values = message.get("values") or {}
-                events = message.get("events") or []
-                if not isinstance(values, Mapping) or not isinstance(events, list):
-                    raise ValueError("values must be an object and events a list")
-            else:
-                values, events = message, []
+            values, events = parse_message(message)
             self.update(values, source=source)
             for event in events:
                 self.press(event, source=source)
@@ -232,7 +245,8 @@ class CommandStream:
         with self._lock:
             events, self._events = tuple(self._events), []
             values = self._live_values(now)
-        return CommandSnapshot(values=values, events=events)
+            end = self._end
+        return CommandSnapshot(values=values, events=events, end=end)
 
     def peek(self) -> dict[str, float]:
         """The live values without draining events."""
@@ -485,10 +499,9 @@ class JoystickSource(_ThreadSource):
     that disconnects stops republishing and its axes fall back to rest. A wireless pad
     can also go silent with its device still open (out of range, flat battery): with
     ``max_silence_s`` set, after that long without any event, the sticks publish rest
-    until the pad speaks
-    again. That cutoff is opt-in, because the joystick API reports only changes: a stick
-    held still at full deflection sends no events either. With a ``deadman`` button,
-    sticks count only while it is held.
+    until the pad speaks again. That cutoff is opt-in, because the joystick API reports
+    only changes: a stick held still at full deflection sends no events either. With a
+    ``deadman`` button, sticks count only while it is held.
     """
 
     name = "joystick"

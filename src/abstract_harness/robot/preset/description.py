@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
-import math
 import tomllib
 from dataclasses import dataclass, field
 from difflib import get_close_matches
@@ -127,12 +126,6 @@ class RobotDescription:
     def joint_names(self) -> tuple[str, ...]:
         """The joints the action drives, in action order (empty for ``base_vel``)."""
         return tuple(joint.name for joint in self.joints)
-
-    def state_shape(self, key: str) -> tuple[int, ...]:
-        for state_field in self.state_fields:
-            if state_field.key == key:
-                return state_field.shape
-        raise KeyError(key)
 
     def embodiment_info(self, *, simulated: bool, pace: bool) -> EmbodimentInfo:
         gripper_kinds = {ee.gripper for ee in self.end_effectors if ee.joints}
@@ -317,15 +310,19 @@ def _index(key: str | int, decl: ControllerDecl, what: str) -> int:
     return table[key]
 
 
-def _source_factory(decl: ControllerDecl, base: Path) -> Any:
+def _component(kind: str, spec: str, base: Path, what: str, hint: str = "") -> Any:
+    """The factory a preset names (``registry.lookup``), refused as a ``PresetError``."""
     try:
-        return registry.lookup("command_source", decl.kind, base=base)
+        return registry.lookup(kind, spec, base=base)
     except KeyError as exc:
-        raise PresetError(
-            f"controller {decl.name}: {exc.args[0]} (built in: {', '.join(BUILTIN_CONTROLLERS)})"
-        ) from None
+        raise PresetError(f"{what}: {exc.args[0]}{hint}") from None
     except ConfigError as exc:
-        raise PresetError(f"controller {decl.name}: {exc}") from exc
+        raise PresetError(f"{what}: {exc}") from exc
+
+
+def _source_factory(decl: ControllerDecl, base: Path) -> Any:
+    builtin = f" (built in: {', '.join(BUILTIN_CONTROLLERS)})"
+    return _component("command_source", decl.kind, base, f"controller {decl.name}", builtin)
 
 
 def _controller_source(decl: ControllerDecl, base: Path) -> CommandSource:
@@ -454,11 +451,10 @@ def _frame(name: str, model: RobotModel | None, what: str) -> str:
 
 
 def _joint_limits(
-    section: RobotSection, joints: list[ModelJoint]
+    section: RobotSection, joints: list[ModelJoint], steps: dict[str, Any]
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     names = [joint.name for joint in joints]
     overrides = _per_joint(section.joints.limits, names, "limits")
-    steps = _per_joint(section.joints.max_step, names, "max_step")
     low, high = np.zeros(len(joints)), np.zeros(len(joints))
     for index, joint in enumerate(joints):
         if section.mode == "joint_delta":
@@ -617,8 +613,8 @@ def load_preset(path: Path | str) -> RobotDescription:
         joints = _select_joints(section, model)
         names = [joint.name for joint in joints]
         labels = tuple(names)
-        low, high = _joint_limits(section, joints)
         steps = _per_joint(section.joints.max_step, names, "max_step")
+        low, high = _joint_limits(section, joints, steps)
         max_step = None
         if section.mode == "joint_pos" and steps:
             max_step = tuple(steps.get(name) for name in names)
@@ -721,8 +717,6 @@ def load_preset(path: Path | str) -> RobotDescription:
 
 def _resolved(ee: EndEffector, joints: tuple[str, ...]) -> ResolvedEndEffector:
     offset = (float(ee.offset[0]), float(ee.offset[1]), float(ee.offset[2]))
-    if not all(math.isfinite(value) for value in offset):
-        raise PresetError(f"end effector {ee.name}: offset must be finite")
     return ResolvedEndEffector(
         name=ee.name,
         frame=ee.frame,

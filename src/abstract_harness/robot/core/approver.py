@@ -16,8 +16,38 @@ import numpy as np
 import numpy.typing as npt
 
 from abstract_harness.robot.core.errors import SafetyAbort
-from abstract_harness.robot.core.spaces import ABSOLUTE_CONTROL_MODES, Box, RotationRepr
+from abstract_harness.robot.core.spaces import (
+    ABSOLUTE_CONTROL_MODES,
+    RATE_CONTROL_MODES,
+    Box,
+    RotationRepr,
+)
 from abstract_harness.robot.core.types import Action
+
+#: The ``meta`` flags the built-in approvers set on an action they changed.
+APPROVER_FLAGS = ("clamped", "delta_clamped", "accel_clamped")
+#: ``DeltaLimitApprover``'s default per-step limit, as a fraction of a dimension's range.
+DEFAULT_STEP_FRACTION = 0.05
+
+
+def default_step_limits(space: Box) -> npt.NDArray[np.float64]:
+    """The per-step limit ``DeltaLimitApprover`` enforces by default: each dimension's
+    declared ``max_step``, else ``DEFAULT_STEP_FRACTION`` of its range (``inf`` without
+    bounds)."""
+    declared = (space.semantics.max_step if space.semantics else None) or (None,) * space.dim
+    if space.low is not None and space.high is not None:
+        span = np.asarray(space.high, np.float64).reshape(-1) - np.asarray(
+            space.low, np.float64
+        ).reshape(-1)
+    else:
+        span = np.full(space.dim, np.inf)
+    return np.array(
+        [
+            DEFAULT_STEP_FRACTION * span[i] if step is None else step
+            for i, step in enumerate(declared)
+        ],
+        dtype=np.float64,
+    )
 
 
 @runtime_checkable
@@ -218,7 +248,7 @@ class DeltaLimitApprover:
                     low_undeclared = low.reshape(-1)[undeclared]
                     high_undeclared = high.reshape(-1)[undeclared]
                     with np.errstate(over="ignore", invalid="ignore"):
-                        native_default = 0.05 * (high_undeclared - low_undeclared)
+                        native_default = DEFAULT_STEP_FRACTION * (high_undeclared - low_undeclared)
                     if not bool(
                         np.all(np.isfinite(low_undeclared))
                         and np.all(np.isfinite(high_undeclared))
@@ -307,8 +337,6 @@ class AccelerationLimitApprover:
         *,
         rest: Callable[[], bool] | None = None,
     ):
-        from abstract_harness.robot.core.spaces import RATE_CONTROL_MODES
-
         sem = action_space.semantics
         if sem is None or sem.control_mode not in RATE_CONTROL_MODES:
             raise ValueError(
@@ -328,14 +356,17 @@ class AccelerationLimitApprover:
         data = np.asarray(action.data, dtype=np.float64)
         if bool(np.isnan(data).any()):
             raise SafetyAbort("AccelerationLimitApprover: action contains NaN")
-        if self._rest is not None and self._rest():
-            store[self._key] = np.zeros_like(self._max)
-        previous = np.asarray(store.get(self._key, np.zeros_like(self._max)), dtype=np.float64)
+        rested = self._rest is not None and self._rest()  # asked every step: it resets
+        previous = store.get(self._key)
+        if previous is None or rested:
+            previous = np.zeros_like(self._max)
         approved = np.clip(data, previous - self._max, previous + self._max)
-        store[self._key] = approved.copy()
+        store[self._key] = approved  # a new array: np.clip copies
         if np.array_equal(approved, data):
             return action
-        return replace(action, data=approved, meta={**dict(action.meta), "accel_clamped": True})
+        return replace(
+            action, data=approved.copy(), meta={**dict(action.meta), "accel_clamped": True}
+        )
 
 
 def _validate_max_delta(

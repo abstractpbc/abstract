@@ -38,6 +38,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -51,8 +52,8 @@ from abstract_harness.robot.agent.policy import (
     _evicted_view,
     _image_parts,
     _observation_content,
-    _sanitize,
 )
+from abstract_harness.robot.core.approver import default_step_limits
 from abstract_harness.robot.core.compat import check_compatibility
 from abstract_harness.robot.core.embodiment import EmbodimentInfo
 from abstract_harness.robot.core.errors import ConfigError
@@ -210,7 +211,11 @@ class OrchestratorPolicy(LLMAgentPolicy):
         super().__init__(**agent_kwargs)
         if self._images not in ("always", "on_demand"):  # pragma: no cover - parent validates
             raise ConfigError("images must be 'always' or 'on_demand'")
-        self._api = api if api is not None else load_extensions(extensions)
+        if isinstance(extensions, str):
+            named = tuple(item.strip() for item in extensions.split(",") if item.strip())
+        else:
+            named = tuple(extensions or ())
+        self._api = api if api is not None else load_extensions(named)
         if not isinstance(builtin_motion, bool):
             raise ConfigError("builtin_motion must be true or false")
         self._builtin_motion = builtin_motion
@@ -228,19 +233,15 @@ class OrchestratorPolicy(LLMAgentPolicy):
         self._clock = clock
         self._lock = threading.RLock()
         self._wake = threading.Condition(self._lock)
-        self._bound: dict[str, Any] = {}
         self._tool_dims: dict[str, tuple[int, ...]] = {}
         self._schemas: list[dict[str, Any]] = []
         self._absolute = False
         self._state_key: str | None = None
         self._labels: tuple[str, ...] = ()
         self._generation = 0
+        # Each policy tool's policy, built once and bound to the dims it drives.
         self._instances: dict[str, Any] = {}
         self._reset_trial_state()
-        if isinstance(extensions, str):
-            named = tuple(item.strip() for item in extensions.split(",") if item.strip())
-        else:
-            named = tuple(extensions or ())
         self.config = OrchestratorPolicyConfig(
             **asdict(self.config),
             extensions=named,
@@ -266,20 +267,9 @@ class OrchestratorPolicy(LLMAgentPolicy):
         space = embodiment_info.action_space
         semantics = space.semantics
         assert semantics is not None  # the toolset refuses spaces without semantics
-        self._labels = semantics.dim_labels or tuple(str(i) for i in range(space.dim))
+        self._labels = space.labels
         self._absolute = semantics.control_mode in ABSOLUTE_CONTROL_MODES
-        # The per-step limit the default delta limiter enforces: a declared max_step, else
-        # 5% of the range (no limit without bounds).
-        declared = semantics.max_step or (None,) * space.dim
-        span = (
-            np.asarray(space.high, dtype=np.float64) - np.asarray(space.low, dtype=np.float64)
-            if space.low is not None and space.high is not None
-            else np.full(space.dim, np.inf)
-        )
-        self._step_limit = np.array(
-            [step if step is not None else 0.05 * span[i] for i, step in enumerate(declared)],
-            dtype=np.float64,
-        )
+        self._step_limit = default_step_limits(space)
         if self._absolute:
             keys = reference_state_keys(
                 embodiment_info.observation_space.state, space.dim, semantics.control_mode
@@ -301,17 +291,12 @@ class OrchestratorPolicy(LLMAgentPolicy):
             bind = getattr(policy, "bind", None)
             if callable(bind):
                 bind(sub_info)
-
-            class _Shim:
-                info = sub_info
-
-            report = check_compatibility(policy, cast(Any, _Shim()))
+            report = check_compatibility(policy, cast(Any, SimpleNamespace(info=sub_info)))
             if not report.ok:
                 problems = "; ".join(f"{i.code}: {i.message}" for i in report.errors)
                 raise ConfigError(
                     f"policy tool {spec.name!r} cannot drive {sub_info.name!r}: {problems}"
                 )
-            self._bound[spec.name] = policy
         toolset = self._toolset
         assert toolset is not None
         agent_tools = {schema["function"]["name"]: schema for schema in toolset.schemas()}
@@ -354,7 +339,6 @@ class OrchestratorPolicy(LLMAgentPolicy):
         self._policy_jobs: dict[str, PolicyBehavior] = {}
         self._hold: npt.NDArray[np.float64] | None = None
         self._started_at = self._clock()
-        self._stopped_jobs = False
 
     def reset(self, scene: Scene) -> None:
         """Stop any previous trial's model thread and jobs, then start a conversation."""
@@ -364,21 +348,15 @@ class OrchestratorPolicy(LLMAgentPolicy):
         with self._lock:
             self._generation += 1
             self._reset_trial_state()
-            prompt = _SYSTEM_TEMPLATE.format(name=self._embodiment_name, budget=self._max_llm_calls)
-            docs = self._embodiment_docs
-            if docs is not None and docs.strip():
-                prompt += "\n\nEmbodiment notes:\n" + docs.strip()
-            if self._max_steps is not None:
-                prompt += (
-                    f"\n\nThe trial ends after {self._max_steps} control steps "
+            prompt = self._with_context(
+                _SYSTEM_TEMPLATE.format(name=self._embodiment_name, budget=self._max_llm_calls),
+                None
+                if self._max_steps is None
+                else (
+                    f"The trial ends after {self._max_steps} control steps "
                     f"(about {self._max_steps / (self.info.control_hz or 10.0):.0f}s)."
-                )
-            if self._prior_learnings_text is not None:
-                prompt += (
-                    "\n\nNotes from a previous attempt at tasks like this one. They may be "
-                    "wrong or stale; the current observation always wins:\n"
-                    + self._prior_learnings_text
-                )
+                ),
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": f"Goal: {scene.instruction}"},
@@ -409,14 +387,12 @@ class OrchestratorPolicy(LLMAgentPolicy):
         self._stop_all("trial ended")
 
     def transcript(self) -> list[dict[str, Any]] | None:
-        with self._lock:
-            return _sanitize(self._messages) if self._messages else None
+        with self._lock:  # the model thread appends to the conversation
+            return super().transcript()
 
     def transcript_delta(self) -> list[dict[str, Any]] | None:
         with self._lock:
-            new = self._messages[self._delta_cursor :]
-            self._delta_cursor = len(self._messages)
-            return _sanitize(new) if new else None
+            return super().transcript_delta()
 
     # -- the control loop (rollout thread) -----------------------------------------------
 
@@ -478,7 +454,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
         if self._finish is not None:
             self._stop_all(str(self._finish.get("stop_reason", "done")))
             assert self._hold is not None
-            data = self._hold.copy() if self._absolute else np.zeros(len(self._labels))
+            data = self._hold.copy()  # zeros unless absolute
             return ActionChunk(
                 actions=[Action(data=data, meta=dict(self._finish))],
                 control_hz=self.info.control_hz,
@@ -520,16 +496,14 @@ class OrchestratorPolicy(LLMAgentPolicy):
             elif kind == "steer":
                 job = self._jobs.get(op[1])
                 if job is None:
-                    self._post(
-                        JobEvent(op[1], "steer ignored: the job already ended", kind="steered")
-                    )
+                    self._post(JobEvent(op[1], "steer ignored: the job already ended"))
                     continue
                 try:
                     reply = job.steer(op[2])
                 except Exception as exc:
-                    self._post(JobEvent(job.id, f"steer refused: {exc}", kind="steered"))
+                    self._post(JobEvent(job.id, f"steer refused: {exc}"))
                 else:
-                    self._post(JobEvent(job.id, reply, wake=False, kind="steered"))
+                    self._post(JobEvent(job.id, reply, wake=False))
 
     def _start(
         self,
@@ -562,18 +536,12 @@ class OrchestratorPolicy(LLMAgentPolicy):
             with self._lock:
                 self._release(job_id)
                 self._history.append(self._entry(job_id, tool, arguments, "failed", str(exc)))
-            self._post(
-                JobEvent(job_id, f"failed to start: {type(exc).__name__}: {exc}", kind="failed")
-            )
+            self._post(JobEvent(job_id, f"failed to start: {type(exc).__name__}: {exc}"))
             return
         with self._lock:
             self._jobs[job_id] = job
             self._history.append(self._entry(job_id, tool, arguments, "running", ""))
-        self._post(
-            JobEvent(
-                job_id, f"started; drives {', '.join(context.labels)}", wake=False, kind="started"
-            )
-        )
+        self._post(JobEvent(job_id, f"started; drives {', '.join(context.labels)}", wake=False))
 
     def _entry(
         self, job_id: str, tool: str, arguments: dict[str, Any], status: str, text: str
@@ -591,7 +559,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
     def _compose(self, observation: Observation) -> npt.NDArray[np.float64]:
         assert self._hold is not None
         dim = len(self._labels)
-        data = self._hold.copy() if self._absolute else np.zeros(dim)
+        data = self._hold.copy()  # zeros unless absolute
         ended: list[tuple[Job, str, str]] = []
         for job in list(self._jobs.values()):
             try:
@@ -648,7 +616,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
             job.stop()
         except Exception as exc:
             text = f"{text} (its stop() raised {type(exc).__name__}: {exc})"
-        self._post(JobEvent(job.id, f"{status}: {text}" if text else status, kind=status))
+        self._post(JobEvent(job.id, f"{status}: {text}" if text else status))
 
     def _release(self, job_id: str) -> None:
         for index in [i for i, owner in self._claims.items() if owner == job_id]:
@@ -923,7 +891,8 @@ class OrchestratorPolicy(LLMAgentPolicy):
     def _status(self) -> str:
         with self._lock:
             lines = [
-                f"{job.id}: running, {_describe(job).removeprefix(job.id + ' (').rstrip(')')}"
+                f"{job.id}: running, {job.context.elapsed_s:.1f}s, drives "
+                + ", ".join(job.context.labels)
                 for job in self._jobs.values()
             ]
             lines += [
@@ -984,7 +953,7 @@ class OrchestratorPolicy(LLMAgentPolicy):
             return f"the previous {spec.name} inference is still running; try again shortly", None
         factory: Callable[[JobContext], Any]
         if spec.policy is not None:
-            policy = self._bound[spec.name]
+            policy = self._instances[spec.name]
 
             def policy_job(context: JobContext) -> PolicyBehavior:
                 return PolicyBehavior(

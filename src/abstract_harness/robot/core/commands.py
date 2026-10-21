@@ -1381,11 +1381,10 @@ def _build_and_announce_guardrails(
     return approver
 
 
-def _announce_live_view(
-    policy_name: str, log_dir: str, env: Mapping[str, str] = os.environ
-) -> None:
-    """Print the copyable browser-view command for agent and orchestrator runs."""
-    if policy_name not in ("agent", "orchestrator"):
+def _announce_live_view(policy: Any, log_dir: str, env: Mapping[str, str] = os.environ) -> None:
+    """Print the copyable browser-view command for a policy that streams a transcript
+    (the agent, the orchestrator)."""
+    if not callable(getattr(policy, "transcript_delta", None)):
         return
     quoted = shlex.quote(log_dir)
     headless = _headless_session(env)
@@ -1419,21 +1418,21 @@ def _announce_timing(
 ) -> None:
     """Say how the loop is paced, so an unpaced physical run is never a surprise."""
     from abstract_harness.robot.core.embodiment import SELF_PACED
-    from abstract_harness.robot.core.timing import resolve_strict_timing
+    from abstract_harness.robot.core.errors import ConfigError
+    from abstract_harness.robot.core.timing import trial_timing
 
-    timing = resolve_strict_timing(strict_timing)
-    hz = embodiment.info.control_hz
+    try:
+        timing, hz, auto = trial_timing(policy, embodiment, strict_timing)
+    except ConfigError:
+        return  # eval refuses the run with the same message
     controller = " with async inference" if async_inference else ""
     if timing is not None:
-        rate = timing.hz or hz
-        rate_text = f"{rate:g} Hz" if rate else "the embodiment's rate"
-        print(f"timing: strict, {rate_text}{controller}")
+        why = " (the policy needs a paced loop)" if auto else ""
+        print(f"timing: strict, {hz:g} Hz{why}{controller}")
     elif SELF_PACED in embodiment.info.capabilities:
         # The usual case (YAM, presets) says nothing new unless something new is on.
         if async_inference:
             print(f"timing: the embodiment paces itself{controller}")
-    elif getattr(policy, "requires_paced_loop", False) is True:
-        print(f"timing: strict (the policy needs a paced loop){controller}")
     elif not embodiment.info.is_simulated:
         print(
             _styled(
@@ -1531,7 +1530,7 @@ def run_task(
             controller = AsyncController()
         _announce_timing(resolved.policy, embodiment, strict_timing, async_inference)
         stream = _command_stream(embodiment, command_sources)
-        _announce_live_view(resolved.policy_name, log_dir)
+        _announce_live_view(resolved.policy, log_dir)
 
         operator_input = None
         operator_session = None

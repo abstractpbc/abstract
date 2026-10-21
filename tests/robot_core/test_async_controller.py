@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from abstract_harness.robot.core import eval
-from abstract_harness.robot.core.controller import _INFER_KEY, _REPORT_KEY, AsyncController
+from abstract_harness.robot.core.controller import _INFER_KEY, AsyncController
 from abstract_harness.robot.core.errors import ConfigError, PolicyError, SafetyAbort
 from abstract_harness.robot.core.mock import CubePickEmbodiment, ScriptedPolicy
 from abstract_harness.robot.core.policy import PolicyConfig, PolicyInfo
@@ -52,6 +52,12 @@ class StepPolicy:
         )
 
 
+def _report(store: dict[str, Any]) -> dict[str, Any]:
+    report = AsyncController().report(store)  # the trial's state lives in the store
+    assert report is not None
+    return report
+
+
 def _obs(t: int) -> Observation:
     return Observation(state={"joint_pos": np.zeros(1)}, extra={"env_step": t})
 
@@ -71,7 +77,7 @@ def test_first_step_waits_for_inference_then_plays_the_chunk() -> None:
     actions, store = _drive(AsyncController(prefetch=0), policy, 4)
     assert [float(a.data[0]) for a in actions] == [0, 1, 2, 3]
     assert policy.calls[0] == 0
-    assert store[_REPORT_KEY]["controller"] == "async"
+    assert _report(store)["controller"] == "async"
 
 
 def test_executed_actions_always_match_their_step_under_latency() -> None:
@@ -84,7 +90,7 @@ def test_executed_actions_always_match_their_step_under_latency() -> None:
             assert float(action.data[0]) < t  # an older prediction, played late
         elif not action.meta.get("hold"):
             assert float(action.data[0]) == t
-    report = store[_REPORT_KEY]
+    report = _report(store)
     assert report["inferences"] >= 4
     assert report["stale_actions"] > 0  # latency compensation dropped elapsed steps
     assert len(store[_INFER_KEY]) == report["inferences"]
@@ -110,7 +116,7 @@ def test_underrun_holds_the_last_absolute_target() -> None:
     # The chunk from step 1 predicted steps 1 and 2: all stale at step 3, so its newest
     # action runs late rather than the robot holding until the next inference.
     assert float(action.data[0]) == 2 and action.meta["late"] is True
-    assert store[_REPORT_KEY]["holds"] >= 1 and store[_REPORT_KEY]["late_actions"] == 1
+    assert _report(store)["holds"] >= 1 and _report(store)["late_actions"] == 1
 
 
 @pytest.mark.parametrize("mode", ["joint_delta", "eef_delta_pos", "joint_vel", "base_vel"])
@@ -130,7 +136,7 @@ def test_wait_mode_blocks_instead_of_holding() -> None:
     policy = StepPolicy(horizon=1, delay_s=0.02)
     actions, store = _drive(AsyncController(prefetch=0, underrun="wait"), policy, 5)
     assert [float(a.data[0]) for a in actions] == [0, 1, 2, 3, 4]
-    assert store[_REPORT_KEY]["holds"] == 0
+    assert _report(store)["holds"] == 0
 
 
 def test_no_semantics_means_wait() -> None:

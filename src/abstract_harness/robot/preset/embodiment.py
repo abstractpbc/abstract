@@ -41,8 +41,11 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from abstract_harness.robot.core import registry
-from abstract_harness.robot.core.approver import AccelerationLimitApprover, GuardrailContribution
+from abstract_harness.robot.core.approver import (
+    AccelerationLimitApprover,
+    GuardrailContribution,
+    default_step_limits,
+)
 from abstract_harness.robot.core.command_stream import CommandStream
 from abstract_harness.robot.core.embodiment import EmbodimentBase
 from abstract_harness.robot.core.errors import ConfigError, EmbodimentFault
@@ -50,7 +53,7 @@ from abstract_harness.robot.core.scene import Scene
 from abstract_harness.robot.core.spaces import RATE_CONTROL_MODES, Box
 from abstract_harness.robot.core.timing import Pacer
 from abstract_harness.robot.core.types import Action, Observation, StepResult
-from abstract_harness.robot.preset.description import PresetError, RobotDescription, load_preset
+from abstract_harness.robot.preset.description import RobotDescription, _component, load_preset
 
 FALL = "fall_detected"
 
@@ -83,14 +86,9 @@ class PresetEmbodiment(EmbodimentBase):
         self.description: RobotDescription = load_preset(preset)
         section = self.description.section
         self.driver_spec = driver or section.driver
-        try:
-            self._factory = registry.lookup(
-                "driver", self.driver_spec, base=self.description.path.parent
-            )
-        except KeyError as exc:
-            raise PresetError(f"driver: {exc.args[0]}") from None
-        except ConfigError as exc:
-            raise PresetError(f"driver: {exc}") from exc
+        self._factory = _component(
+            "driver", self.driver_spec, self.description.path.parent, "driver"
+        )
         self.simulated = getattr(self._factory, "simulated", False) is True
         paced = _flag(pace, "pace")
         self._pace = section.pace if paced is None else paced
@@ -125,6 +123,13 @@ class PresetEmbodiment(EmbodimentBase):
         self._fault: str | None = None
         self._rested = False
         self._accel_limited = False
+        limits = self.description.position_limits
+        # Unknown limits (NaN) bound nothing.
+        self._position_bounds = (
+            None
+            if limits is None
+            else (np.nan_to_num(limits[0], nan=-np.inf), np.nan_to_num(limits[1], nan=np.inf))
+        )
 
     # -- optional hooks ------------------------------------------------------------
 
@@ -271,19 +276,10 @@ class PresetEmbodiment(EmbodimentBase):
         limits. Waypoints are not clipped to the limits: a joint the operator left past a
         narrowed limit walks back in at the step limit instead of jumping to the bound,
         and a joint without a home value does not move."""
-        measured = self._state(driver)["joint_pos"]
+        measured = self._state(driver, "joint_pos")["joint_pos"]
         target = np.array([measured[i] if value is None else value for i, value in enumerate(home)])
         description = self.description
-        limit = np.array(
-            [
-                step if step is not None else 0.05 * span
-                for step, span in zip(
-                    description.max_step or (None,) * description.dim,
-                    description.high - description.low,
-                    strict=True,
-                )
-            ]
-        )
+        limit = default_step_limits(self.info.action_space)
         distance = np.abs(target - measured)
         movable = limit > 0
         by_limit = int(np.ceil(np.max(distance[movable] / limit[movable]))) if movable.any() else 1
@@ -309,7 +305,7 @@ class PresetEmbodiment(EmbodimentBase):
         with self._lock:
             if self.description.position_limits is not None:
                 # Read just before commanding: the joint has moved since the last step.
-                fresh = self._state(driver)["joint_pos"]
+                fresh = self._state(driver, "joint_pos")["joint_pos"]
                 data, position_clamped = self._within_position_limits(data, fresh)
             if self._rested and self._accel_limited:
                 # The watchdog stopped the base after this action was approved against
@@ -326,7 +322,6 @@ class PresetEmbodiment(EmbodimentBase):
                 driver.stop()
                 self._halted = True
                 self._rested = True
-        key = "joint_pos" if self.description.mode == "joint_pos" else self.description.mode
         info: dict[str, Any] = {"tilt_deg": fallen} if fallen is not None else {}
         if position_clamped:
             info["position_clamped"] = True
@@ -335,7 +330,7 @@ class PresetEmbodiment(EmbodimentBase):
             terminated=fallen is not None,
             termination_reason=FALL if fallen is not None else None,
             info=info,
-            command={key: data.copy()},
+            command={self.description.mode: data.copy()},
             command_time=command_time,
         )
 
@@ -348,15 +343,13 @@ class PresetEmbodiment(EmbodimentBase):
         back in but is never pushed. A delta applies to the measured position; a velocity
         is assumed to last until the watchdog would stop it (``command_timeout_s``), the
         longest it can persist without another step."""
-        limits = self.description.position_limits
-        if limits is None:
+        if self._position_bounds is None:
             return data, False
-        low, high = limits
+        low, high = self._position_bounds
         dt = 1.0 if self.description.mode == "joint_delta" else self._rate_timeout
-        with np.errstate(invalid="ignore"):
-            room_up = np.where(np.isnan(high), np.inf, np.maximum(high - measured, 0.0)) / dt
-            room_down = np.where(np.isnan(low), -np.inf, np.minimum(low - measured, 0.0)) / dt
-        limited = np.where(data > 0, np.minimum(data, room_up), np.maximum(data, room_down))
+        room_up = np.maximum(high - measured, 0.0) / dt
+        room_down = np.minimum(low - measured, 0.0) / dt
+        limited = np.clip(data, room_down, room_up)
         if np.array_equal(limited, data):
             return data, False
         return limited, True
@@ -374,12 +367,15 @@ class PresetEmbodiment(EmbodimentBase):
 
     # -- observation and safety ------------------------------------------------------
 
-    def _state(self, driver: Any) -> dict[str, npt.NDArray[np.float64]]:
+    def _state(self, driver: Any, *only: str) -> dict[str, npt.NDArray[np.float64]]:
+        """The driver's state, every field checked (or just the ``only`` fields)."""
         raw = driver.read()
         if not isinstance(raw, Mapping):
             raise EmbodimentFault(f"driver read() returned {type(raw).__name__}, not a mapping")
         state: dict[str, npt.NDArray[np.float64]] = {}
         for state_field in self.description.state_fields:
+            if only and state_field.key not in only:
+                continue
             if state_field.key not in raw:
                 raise EmbodimentFault(f"driver read() is missing state {state_field.key!r}")
             try:

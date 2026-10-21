@@ -26,7 +26,7 @@ import fnmatch
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import numpy as np
@@ -36,7 +36,7 @@ from abstract_harness.robot.core.controller import DefaultController
 from abstract_harness.robot.core.embodiment import EmbodimentInfo
 from abstract_harness.robot.core.errors import ConfigError
 from abstract_harness.robot.core.scene import Scene
-from abstract_harness.robot.core.spaces import ActionSemantics, Box
+from abstract_harness.robot.core.spaces import Box
 from abstract_harness.robot.core.types import Action, ActionChunk, Observation
 
 if TYPE_CHECKING:
@@ -60,8 +60,6 @@ class JobEvent:
     job: str
     text: str
     wake: bool = True
-    kind: str = "progress"  # progress | finished | failed | stopped | steered | started
-    time: float = field(default_factory=time.monotonic)
 
 
 class JobContext:
@@ -84,12 +82,7 @@ class JobContext:
         self.arguments = dict(arguments)
         self.embodiment = embodiment
         self.dims = dims
-        labels = (
-            embodiment.action_space.semantics.dim_labels
-            if embodiment.action_space.semantics is not None
-            else None
-        )
-        all_labels = labels or tuple(str(i) for i in range(embodiment.action_space.dim))
+        all_labels = embodiment.action_space.labels
         self.labels = tuple(all_labels[i] for i in dims)
         #: Job-local live commands, merged over the stream's in ``extra["commands"]``.
         self.commands: dict[str, float] = {}
@@ -126,9 +119,7 @@ def resolve_controls(patterns: Sequence[str] | None, info: EmbodimentInfo) -> tu
     if not patterns:
         return tuple(range(dim))
     semantics = info.action_space.semantics
-    labels = (semantics.dim_labels if semantics is not None else None) or tuple(
-        str(i) for i in range(dim)
-    )
+    labels = info.action_space.labels
     parts = semantics.dim_parts if semantics is not None else None
     chosen: list[int] = []
     for pattern in patterns:
@@ -152,21 +143,20 @@ def sub_embodiment(info: EmbodimentInfo, dims: tuple[int, ...]) -> EmbodimentInf
         return info
     index = list(dims)
     semantics = space.semantics
-    sub_semantics = None
-    if semantics is not None:
 
-        def pick(values: tuple[Any, ...] | None) -> tuple[Any, ...] | None:
-            return tuple(values[i] for i in index) if values is not None else None
+    def pick(values: tuple[Any, ...] | None) -> tuple[Any, ...] | None:
+        return tuple(values[i] for i in index) if values is not None else None
 
-        sub_semantics = ActionSemantics(
-            control_mode=semantics.control_mode,
-            rotation_repr=semantics.rotation_repr,
-            gripper=semantics.gripper,
-            frame=semantics.frame,
+    sub_semantics = (
+        None
+        if semantics is None
+        else replace(
+            semantics,
             dim_labels=pick(semantics.dim_labels),
             max_step=pick(semantics.max_step),
             dim_parts=pick(semantics.dim_parts),
         )
+    )
     box = Box(
         shape=(len(index),),
         low=None if space.low is None else np.asarray(space.low).reshape(-1)[index],
@@ -196,11 +186,15 @@ class Job:
         self.max_seconds = max_seconds
         self.monitors = tuple(monitors)
         self._buffer: deque[Action] = deque()
-        self.ended: tuple[str, str] | None = None
 
     @property
     def id(self) -> str:
         return self.context.job_id
+
+    @property
+    def ended(self) -> tuple[str, str] | None:
+        """``(finished | failed, text)`` once the job has ended."""
+        return self.context.outcome
 
     def step(self, observation: Observation, dim: int) -> npt.NDArray[np.float64] | None:
         """This tick's values for the job's dims (``None``: hold); sets ``ended`` when the
@@ -208,7 +202,6 @@ class Job:
         context = self.context
         if self.max_seconds is not None and context.elapsed_s > self.max_seconds:
             context.fail(f"timed out after {self.max_seconds:g}s")
-            self.ended = context.outcome
             return None
         if not self._buffer:
             out = self.behavior.step(observation)
@@ -232,8 +225,6 @@ class Job:
         for monitor in self.monitors:
             monitor(observation, context)
         context.steps += 1
-        if context.outcome is not None:
-            self.ended = context.outcome
         return values
 
     def _values(self, action: Action, dim: int) -> npt.NDArray[np.float64]:
@@ -318,19 +309,12 @@ class PolicyBehavior:
             raise ValueError("nothing to steer: pass instruction or command values")
         return "now " + ", ".join(changed)
 
-    def stop(self) -> None:
-        """Nothing to wait for here: an inference still in the background finishes on its
-        own, and ``busy()`` keeps the policy from another job until it does. Stopping
-        never stalls the control loop."""
-        return None
-
     def busy(self) -> bool:
         """Whether an inference of this job is still running on a controller worker, so
-        the shared policy must not be reset for another job yet."""
-        from abstract_harness.robot.core.controller import _ASYNC_KEY
-
-        worker = getattr(self._store.get(_ASYNC_KEY), "worker", None)
-        return worker is not None and worker.is_alive()
+        the shared policy must not be reset for another job yet. Stopping the job never
+        waits for it: that would stall the control loop."""
+        in_flight = getattr(self.controller, "in_flight", None)
+        return bool(in_flight(self._store)) if callable(in_flight) else False
 
 
 class MotionBehavior:

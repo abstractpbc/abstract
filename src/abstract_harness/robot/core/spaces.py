@@ -163,6 +163,12 @@ class Box:
             out *= n
         return out
 
+    @property
+    def labels(self) -> tuple[str, ...]:
+        """Each dimension's name: the declared ``dim_labels``, else its index."""
+        declared = self.semantics.dim_labels if self.semantics is not None else None
+        return declared or tuple(str(i) for i in range(self.dim))
+
 
 @dataclass(frozen=True)
 class CameraSpec:

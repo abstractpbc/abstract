@@ -13,6 +13,7 @@ import sys
 import threading
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
@@ -236,13 +237,16 @@ def test_live_view_tip_uses_local_and_headless_variants_with_quoted_log_dir(
 ) -> None:
     log_dir = tmp_path / "rig logs' current"
 
-    commands._announce_live_view("agent", str(log_dir), {"DISPLAY": ":0"})
+    agent = SimpleNamespace(transcript_delta=lambda: None)  # a policy with a transcript
+    commands._announce_live_view(ScriptedPolicy(), str(log_dir), {"DISPLAY": ":0"})
+    assert capsys.readouterr().out == ""
+    commands._announce_live_view(agent, str(log_dir), {"DISPLAY": ":0"})
     local = capsys.readouterr().out
     assert f"abstract robot view {shlex.quote(str(log_dir))} --serve --open" in local
     assert "; open http://" not in local
 
     commands._announce_live_view(
-        "agent",
+        agent,
         str(log_dir),
         {"SSH_CONNECTION": "2001:db8::2 50123 2001:db8::10 22", "DISPLAY": ":0"},
     )
@@ -251,7 +255,7 @@ def test_live_view_tip_uses_local_and_headless_variants_with_quoted_log_dir(
     assert "open http://[2001:db8::10]:8300/" in remote
 
     monkeypatch.setattr("socket.gethostname", lambda: "robot-host")
-    commands._announce_live_view("agent", str(log_dir), {"SSH_CONNECTION": "malformed"})
+    commands._announce_live_view(agent, str(log_dir), {"SSH_CONNECTION": "malformed"})
     assert "open http://robot-host:8300/" in capsys.readouterr().out
 
 

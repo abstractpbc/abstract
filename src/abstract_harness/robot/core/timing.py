@@ -28,9 +28,13 @@ import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from abstract_harness.robot.core.errors import ConfigError, SafetyAbort
+
+if TYPE_CHECKING:
+    from abstract_harness.robot.core.embodiment import Embodiment
+    from abstract_harness.robot.core.policy import Policy
 
 # A step dispatched within this fraction of a period after its deadline is on time:
 # sleep granularity and scheduler noise, not lateness.
@@ -56,9 +60,9 @@ class StrictTiming:
         if self.hz is not None:
             _check_hz(self.hz)
         limit = self.max_consecutive_overruns
-        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)):
-            raise ConfigError("max_consecutive_overruns must be an integer >= 1 or None")
-        if limit is not None and limit < 1:
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
             raise ConfigError("max_consecutive_overruns must be an integer >= 1 or None")
         if self.tolerance_s is not None and (
             isinstance(self.tolerance_s, bool)
@@ -67,14 +71,7 @@ class StrictTiming:
         ):
             raise ConfigError("tolerance_s must be finite and >= 0")
 
-    def pacer(
-        self,
-        hz: float,
-        *,
-        auto: bool = False,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> Pacer:
+    def pacer(self, hz: float, *, auto: bool = False) -> Pacer:
         """A fresh pacer for one trial at ``hz`` (this config's ``hz`` when set).
         ``auto`` records that the policy, not the caller, asked for the paced loop."""
         return Pacer(
@@ -82,8 +79,6 @@ class StrictTiming:
             max_consecutive_overruns=self.max_consecutive_overruns,
             tolerance_s=self.tolerance_s,
             auto=auto,
-            clock=clock,
-            sleep=sleep,
         )
 
 
@@ -102,6 +97,35 @@ def resolve_strict_timing(value: bool | StrictTiming | None) -> StrictTiming | N
     if isinstance(value, StrictTiming):
         return value
     raise ConfigError(f"strict_timing must be a bool or StrictTiming, got {value!r}")
+
+
+def trial_timing(
+    policy: Policy, embodiment: Embodiment, strict_timing: bool | StrictTiming | None
+) -> tuple[StrictTiming | None, float, bool]:
+    """How an eval paces its trials: (config or ``None``, tick rate, enabled automatically).
+
+    A policy that ``requires_paced_loop`` gets strict timing on an embodiment that does not
+    pace itself. The rate is the config's ``hz``, else the embodiment's ``control_hz``,
+    else the policy's; ``ConfigError`` when none declares one."""
+    from abstract_harness.robot.core.embodiment import SELF_PACED
+
+    timing = resolve_strict_timing(strict_timing)
+    auto = False
+    if (
+        timing is None
+        and getattr(policy, "requires_paced_loop", False) is True
+        and SELF_PACED not in embodiment.info.capabilities
+    ):
+        timing, auto = StrictTiming(), True
+    if timing is None:
+        return None, 0.0, False
+    hz = timing.hz or embodiment.info.control_hz or policy.info.control_hz
+    if hz is None:
+        raise ConfigError(
+            f"strict timing needs a tick rate, and embodiment {embodiment.info.name!r} "
+            "declares no control_hz; pass StrictTiming(hz=...)"
+        )
+    return timing, float(hz), auto
 
 
 class Pacer:

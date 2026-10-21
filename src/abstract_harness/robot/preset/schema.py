@@ -6,16 +6,18 @@ the preset is resolved (``description.py``); this module checks shapes and value
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr, model_validator
 
 from abstract_harness.models import Record
+from abstract_harness.robot.core.command_stream import NAME
+from abstract_harness.robot.core.spaces import RATE_CONTROL_MODES
 
 # Explicit TypeAlias rather than `type` statements: pydantic validates these annotations.
-Name: TypeAlias = Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")]  # noqa: UP040
+# Names a command stream accepts, so a preset's commands and events always build.
+Name: TypeAlias = Annotated[str, Field(pattern=NAME.pattern)]  # noqa: UP040
 RobotName: TypeAlias = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]  # noqa: UP040
 Glob: TypeAlias = Annotated[str, Field(min_length=1, max_length=200)]  # noqa: UP040
 Number: TypeAlias = StrictFloat | StrictInt  # noqa: UP040
@@ -38,7 +40,7 @@ KNOWN_STATE: dict[str, int | None] = {
 
 def _range(value: Range, what: str) -> Range:
     low, high = value
-    if not (math.isfinite(low) and math.isfinite(high)) or low > high:
+    if low > high:  # Record refuses inf and NaN
         raise ValueError(f"{what}: expected [low, high] with low <= high, got {list(value)}")
     return value
 
@@ -308,7 +310,7 @@ class RobotSection(Record):
         if self.control_hz is not None and self.control_hz < self.policy_hz:
             raise ValueError("control_hz (the driver's servo rate) must be >= policy_hz")
         timeout = self.command_timeout
-        if self.mode in ("base_vel", "joint_vel") and timeout < 2.0 / self.policy_hz:
+        if self.mode in RATE_CONTROL_MODES and timeout < 2.0 / self.policy_hz:
             raise ValueError(
                 f"command_timeout_s {timeout:g} is shorter than two policy periods "
                 f"({2.0 / self.policy_hz:g}s): the watchdog would stop the robot between steps"

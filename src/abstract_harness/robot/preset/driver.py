@@ -106,8 +106,14 @@ class SimDriver:
         self.base_velocity = np.zeros(3)  # vx, vy, yaw_rate (base frame)
         self.tilt_rad = 0.0
         self.connected = False
-        self.commands: list[npt.NDArray[np.float64]] = []
+        self.last_command: npt.NDArray[np.float64] | None = None
         self.stops = 0
+        self._frames: dict[str, npt.NDArray[np.uint8]] = {
+            camera.name: np.full((camera.height, camera.width, camera.channels), 96, np.uint8)
+            for camera in description.cameras
+        }
+        for frame in self._frames.values():
+            frame.setflags(write=False)  # shared by every step
         self.closed = False
 
     def connect(self) -> None:
@@ -119,7 +125,7 @@ class SimDriver:
 
     def command(self, values: npt.NDArray[np.float64]) -> None:
         values = np.asarray(values, dtype=np.float64)
-        self.commands.append(values.copy())
+        self.last_command = values.copy()
         mode = self.description.mode
         if mode == "base_vel":
             by_label = dict(zip(self.description.labels, values.tolist(), strict=True))
@@ -175,10 +181,7 @@ class SimDriver:
         return state
 
     def images(self) -> dict[str, npt.NDArray[np.uint8]]:
-        return {
-            camera.name: np.full((camera.height, camera.width, camera.channels), 96, np.uint8)
-            for camera in self.description.cameras
-        }
+        return dict(self._frames)
 
     def close(self) -> None:
         self.closed = True

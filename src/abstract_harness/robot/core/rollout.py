@@ -18,14 +18,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from abstract_harness.robot.core.approver import Approver
-from abstract_harness.robot.core.command_stream import END_EPISODE
-from abstract_harness.robot.core.controller import (
-    _DISPATCH_KEY,
-    _INFER_KEY,
-    _REPORT_KEY,
-    Controller,
-)
+from abstract_harness.robot.core.approver import APPROVER_FLAGS, Approver
+from abstract_harness.robot.core.controller import _INFER_KEY, Controller
 from abstract_harness.robot.core.embodiment import Embodiment
 from abstract_harness.robot.core.errors import (
     EmbodimentFault,
@@ -61,6 +55,16 @@ _TRANSCRIPT_BYTE_LIMIT = 2 * 1024 * 1024
 _APPROVALS_KEY = "_rollout_approvals"
 _OPERATOR_MSGS_KEY = "_rollout_operator_messages"
 _COMMAND_EVENTS_KEY = "_rollout_command_events"
+
+
+def _delivered_key(key: str) -> str:
+    return f"{key}_delivered"
+
+
+def _pending(store: dict[str, Any], key: str) -> tuple[list[dict[str, Any]], int]:
+    """The entries under ``key`` the policy has not been given yet, and where they end."""
+    entries = store.get(key, [])
+    return [dict(entry) for entry in entries[store.get(_delivered_key(key), 0) :]], len(entries)
 
 
 class _OperatorStopped(Exception):
@@ -332,6 +336,10 @@ def rollout(
 
     try:
         t = -1
+        # A controller that infers in the background says when an observation went out.
+        last_dispatch = getattr(controller, "last_dispatch", None)
+        if not callable(last_dispatch):
+            last_dispatch = None
         try:
             prepare = getattr(controller, "prepare_trial", None)
             if callable(prepare):
@@ -411,33 +419,23 @@ def rollout(
             end_by_command = False
             if commands is not None and commands.active:
                 snapshot = commands.snapshot()
-                command_values = dict(snapshot.values)
+                command_values = snapshot.values
                 for event in snapshot.events:
                     store.setdefault(_COMMAND_EVENTS_KEY, []).append(
                         {"t": t, "name": event.name, "source": event.source}
                     )
                     record.events.append(command_event(t, event.name, event.source))
-                    end_by_command = end_by_command or event.name == END_EPISODE
-                # Latched even when the event queue was full and dropped the event itself.
-                end_by_command = end_by_command or commands.end_requested()
+                end_by_command = snapshot.end
 
             prev_inferences = len(store.get(_INFER_KEY, []))
-            all_approvals = store.get(_APPROVALS_KEY, [])
-            last_approvals_idx = store.get("_rollout_last_approvals_idx", 0)
-            tail_approvals = [dict(a) for a in all_approvals[last_approvals_idx:]]
-            all_operator_msgs = store.get(_OPERATOR_MSGS_KEY, [])
-            last_operator_msgs_idx = store.get("_rollout_last_operator_msgs_idx", 0)
-            tail_operator_msgs = [
-                dict(message) for message in all_operator_msgs[last_operator_msgs_idx:]
-            ]
-            # Delivered up to what the tail held: messages typed while this step's
-            # inference runs are appended later and reach the next act().
-            operator_msgs_built = len(all_operator_msgs)
-            all_command_events = store.get(_COMMAND_EVENTS_KEY, [])
-            last_command_events_idx = store.get("_rollout_last_command_events_idx", 0)
-            tail_command_events = [
-                dict(event) for event in all_command_events[last_command_events_idx:]
-            ]
+            # What the policy has not seen yet; delivered up to what each tail held, so
+            # entries appended while this step's inference runs reach the next act().
+            channels = [_APPROVALS_KEY]
+            if operator_input is not None:
+                channels.append(_OPERATOR_MSGS_KEY)
+            if commands is not None:
+                channels.append(_COMMAND_EVENTS_KEY)
+            pending = {key: _pending(store, key) for key in channels}
 
             if poll is not None and poll.end is not None:
                 record.terminated = True
@@ -462,12 +460,12 @@ def rollout(
                 break
 
             try:
-                policy_extra = {**obs.extra, "env_step": t, "approvals": tail_approvals}
+                policy_extra = {**obs.extra, "env_step": t, "approvals": pending[_APPROVALS_KEY][0]}
                 if operator_input is not None:
-                    policy_extra["operator_messages"] = tail_operator_msgs
+                    policy_extra["operator_messages"] = pending[_OPERATOR_MSGS_KEY][0]
                 if command_values is not None:
                     policy_extra["commands"] = command_values
-                    policy_extra["command_events"] = tail_command_events
+                    policy_extra["command_events"] = pending[_COMMAND_EVENTS_KEY][0]
                 obs_with_extra = replace(
                     obs,
                     extra=policy_extra,
@@ -532,16 +530,13 @@ def rollout(
             # took it: at collection for synchronous controllers, at dispatch for a
             # controller that reports it (AsyncController infers in the background).
             delivered = (
-                store.get(_DISPATCH_KEY) == t
-                if _DISPATCH_KEY in store
+                last_dispatch(store) == t
+                if last_dispatch is not None
                 else len(inferences) > prev_inferences
             )
             if delivered:
-                store["_rollout_last_approvals_idx"] = len(all_approvals)
-                if operator_input is not None:
-                    store["_rollout_last_operator_msgs_idx"] = operator_msgs_built
-                if commands is not None:
-                    store["_rollout_last_command_events_idx"] = len(all_command_events)
+                for key, (_, end) in pending.items():
+                    store[_delivered_key(key)] = end
             if len(inferences) > prev_inferences:
                 latency, chunk_len = inferences[-1]
                 record.events.append(inference_event(t, latency, chunk_len))
@@ -609,9 +604,7 @@ def rollout(
             except Exception as exc:
                 raise _record_failure(record, SafetyAbort(str(exc)), t) from exc
             if reviewed is not action:
-                flags = [
-                    k for k in ("clamped", "delta_clamped", "accel_clamped") if reviewed.meta.get(k)
-                ]
+                flags = [k for k in APPROVER_FLAGS if reviewed.meta.get(k)]
                 detail = ", ".join(flags) or None
                 record.events.append(approval_event(t, modified=True, detail=detail))
                 store.setdefault(_APPROVALS_KEY, []).append({"t": t, "detail": detail})
@@ -720,7 +713,8 @@ def rollout(
         ]
         if pacer is not None:
             record.metadata["timing"] = pacer.report()
-        controller_report = store.get(_REPORT_KEY)
+        report = getattr(controller, "report", None)
+        controller_report = report(store) if callable(report) else None
         if isinstance(controller_report, Mapping):
             record.metadata["controller"] = dict(controller_report)
         if policy_reset_ok:  # false while an exception unwinds or an inference was abandoned

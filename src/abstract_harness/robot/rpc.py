@@ -917,26 +917,15 @@ class Controller:
         to number, e.g. ``{"vx": 0.3}``) and ``events`` (names, e.g. ``["go"]``). The run's
         command stream clamps values to their declared ranges and returns them to rest
         when they stop arriving; ``end_episode`` ends the episode."""
-        from abstract_harness.robot.core.command_stream import NAME
+        from abstract_harness.robot.core.command_stream import parse_message
 
-        values = command.get("values") or {}
-        events_ = command.get("events") or []
-        if not isinstance(values, dict) or not isinstance(events_, list):
-            raise ValueError("values must be an object and events a list")
+        values, events_ = parse_message(
+            {"values": command.get("values") or {}, "events": command.get("events") or []}
+        )
         if not values and not events_:
             raise ValueError("send values, events or both")
         if len(values) + len(events_) > 64:
             raise ValueError("at most 64 values and events per command")
-        for name, value in values.items():
-            if not NAME.match(name):
-                raise ValueError(f"command name {name!r} must match {NAME.pattern}")
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                raise ValueError(f"value for {name!r} must be a number")
-            if value != value or value in (float("inf"), float("-inf")):
-                raise ValueError(f"value for {name!r} must be finite")
-        for name in events_:
-            if not isinstance(name, str) or not NAME.match(name):
-                raise ValueError(f"event {name!r} must match {NAME.pattern}")
         line = json.dumps({"values": values, "events": events_}).encode() + b"\n"
         if len(line) > select.PIPE_BUF:
             # Larger writes may interleave or split; a command must arrive whole.

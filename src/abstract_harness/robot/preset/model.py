@@ -59,14 +59,18 @@ class RobotModel:
     format: str  # "urdf" | "mjcf"
     path: Path
     joints: tuple[ModelJoint, ...] = ()
-    frames: frozenset[str] = frozenset()
     # MJCF: joints in actuator order (what ``data.ctrl`` drives); empty for URDF.
     actuated: tuple[str, ...] = ()
     digest: str = ""
+    # Every frame a preset may name (link, body, site, camera), with its kind.
     frame_kinds: dict[str, str] = field(default_factory=dict)
     # MJCF actuators that drive no joint of the model (tendons, sites, bodies): a default
     # selection by actuator order would silently miss them.
     unresolved_actuators: tuple[str, ...] = ()
+
+    @property
+    def frames(self) -> frozenset[str]:
+        return frozenset(self.frame_kinds)
 
     def joint(self, name: str) -> ModelJoint | None:
         for joint in self.joints:
@@ -163,15 +167,13 @@ def _urdf(root: ET.Element, path: Path, digest: str) -> RobotModel:
                 child=child.get("link") if child is not None else None,
             )
         )
-    frames = frozenset(name for name in links if name)
     return RobotModel(
         name=root.get("name") or path.stem,
         format="urdf",
         path=path,
         joints=tuple(joints),
-        frames=frames,
         digest=digest,
-        frame_kinds={name: "link" for name in frames},
+        frame_kinds={name: "link" for name in links if name},
     )
 
 
@@ -301,7 +303,6 @@ def _mjcf(root: ET.Element, path: Path, digest: str) -> RobotModel:
         format="mjcf",
         path=path,
         joints=tuple(joints),
-        frames=frozenset(frames),
         actuated=tuple(actuated),
         digest=digest,
         frame_kinds=frames,

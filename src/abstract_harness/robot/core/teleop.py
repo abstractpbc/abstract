@@ -6,9 +6,9 @@ dimension without a command sends zero. Teleop drives displacement and velocity 
 only: there zero is rest, so a command that times out to its default stops the robot.
 An absolute target's default would be a place to move to, so absolute modes are
 refused; drive them with a policy that integrates commands. With a robot preset whose
-gamepad maps sticks to
-``vx``, ``vy`` and ``yaw_rate`` on a ``base_vel`` base, this is joystick driving with
-the bounds clamp, the acceleration limit, the watchdog and fall detection in force.
+gamepad maps sticks to ``vx``, ``vy`` and ``yaw_rate`` on a ``base_vel`` base, this is
+joystick driving with the bounds clamp, the acceleration limit, the watchdog and fall
+detection in force.
 ``map`` renames: ``"yaw_rate:turn,vx:forward"`` reads the ``turn`` and ``forward``
 commands. The policy never ends the trial; ``end_episode`` (a button) or the console does.
 """

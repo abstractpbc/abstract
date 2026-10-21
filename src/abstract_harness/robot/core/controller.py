@@ -30,6 +30,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
+from abstract_harness.robot.core.errors import ConfigError, PolicyError, SafetyAbort
 from abstract_harness.robot.core.policy import Policy
 from abstract_harness.robot.core.spaces import ABSOLUTE_CONTROL_MODES, Box
 from abstract_harness.robot.core.types import Action, ActionChunk, Observation
@@ -37,9 +38,6 @@ from abstract_harness.robot.core.types import Action, ActionChunk, Observation
 _BUFFER_KEY = "_controller_action_buffer"
 # Each entry is (inference_latency_s | None, chunk_len): one per policy.act() call.
 _INFER_KEY = "_controller_inferences"
-# A controller may publish a small JSON-ready report of its trial here; the rollout
-# copies it into ``TrialRecord.metadata["controller"]`` when the trial ends.
-_REPORT_KEY = "_controller_report"
 
 
 @runtime_checkable
@@ -228,10 +226,6 @@ class EnsemblingController:
 
 
 _ASYNC_KEY = "_async_controller_trial"
-#: Set by a controller to the step whose observation it just handed the policy. The
-#: rollout then marks that step's approvals, operator messages and command events as
-#: delivered; without it, delivery is assumed at every collected inference.
-_DISPATCH_KEY = "_controller_dispatch_step"
 
 
 @dataclass
@@ -274,40 +268,23 @@ def _stop_meta(actions: Any) -> dict[str, Any]:
 
 
 class AsyncController:
-    """Overlap inference with execution: the robot keeps moving while the policy thinks.
+    """Overlap inference with execution: the robot keeps moving while the policy thinks
+    (``docs/LIVE_CONTROL.md``).
 
-    The first call of a trial runs one inference and waits for it. After that, whenever
-    ``prefetch`` or fewer buffered actions remain (an int, or a fraction of the last
-    chunk's length), the next inference starts on a worker thread from the current
-    observation while the buffer keeps playing; no observation is sent twice. A chunk
-    computed from the observation of step ``q`` predicts steps ``q, q+1, ...``: when it
-    arrives at step ``t`` its first ``t - q`` actions are already stale and are dropped,
-    and the rest replace whatever is still buffered (the newer prediction wins). When the
-    whole chunk is stale (a one-action reactive policy, or latency longer than the
-    chunk), its last action runs at ``t``, one or more steps late, marked
-    ``meta["late"]``.
+    When ``prefetch`` or fewer buffered actions remain (an int, or a fraction of the last
+    chunk), the next inference starts on a worker thread from the current observation.
+    A chunk from step ``q`` that arrives at step ``t`` drops its first ``t - q`` actions;
+    a wholly stale chunk plays its last action late (``meta["late"]``). An underrun
+    holds (``meta["hold"]``: the last target for absolute modes, zeros otherwise), or
+    blocks with ``underrun="wait"`` or without action semantics. Stop requests are never
+    dropped. Inference past ``timeout_s`` raises ``SafetyAbort``. Policies with
+    ``observe()`` or ``transcript_delta()`` hooks are refused: only ``act()`` may run on
+    the worker.
 
-    If the buffer runs dry while inference is still running (an *underrun*), the
-    controller holds: an absolute-target action space repeats the last action, any
-    other mode (displacements, velocities) sends zeros, so the robot stays where it is.
-    ``underrun="wait"`` blocks instead, as ``DefaultController`` would; that is also the
-    behavior when the action space declares no semantics. Hold actions carry
-    ``meta["hold"] = True``. A stop request is never lost: a buffered one is not
-    replaced by a later prediction, and one on a dropped stale action rides the next
-    action out.
-
-    Use it on a paced loop (strict timing or a self-paced embodiment): on an unpaced
-    simulator the loop would spin through hold steps while inference runs. Only
-    ``act()`` runs on the worker, so policies whose ``observe()`` or
-    ``transcript_delta()`` hooks would run concurrently with it (stateful world models,
-    the LLM agent) are refused. An inference running longer than ``timeout_s`` raises
-    ``SafetyAbort``. The policy is never read or reset while ``act()`` runs: at the end
-    of a trial the rollout calls ``end_trial``, which waits for an inference still in
-    flight until that inference's own deadline (``timeout_s`` from its dispatch), and
-    one that never returns marks the policy abandoned; before the next trial's
-    ``policy.reset()`` it calls ``prepare_trial``, which refuses (``PolicyError``) while
-    a previous inference still runs. The trial's counts (inferences, holds, late and
-    stale actions) land in ``TrialRecord.metadata["controller"]``.
+    The rollout's optional controller hooks: ``prepare_trial`` refuses to start while a
+    previous inference still runs, ``end_trial`` waits for one until its deadline,
+    ``last_dispatch`` names the step whose observation went to the policy, and
+    ``report`` returns the trial's counts for ``TrialRecord.metadata["controller"]``.
     """
 
     def __init__(
@@ -318,13 +295,12 @@ class AsyncController:
         timeout_s: float = 120.0,
         clock: Callable[[], float] = time.monotonic,
     ):
-        from abstract_harness.robot.core.errors import ConfigError
-
-        if isinstance(prefetch, bool) or not isinstance(prefetch, int | float):
-            raise ConfigError("prefetch must be an int >= 0 or a fraction in (0, 1]")
-        if isinstance(prefetch, int) and prefetch < 0:
-            raise ConfigError("prefetch must be an int >= 0 or a fraction in (0, 1]")
-        if isinstance(prefetch, float) and not 0.0 < prefetch <= 1.0:
+        if (
+            isinstance(prefetch, bool)
+            or not isinstance(prefetch, int | float)
+            or (isinstance(prefetch, int) and prefetch < 0)
+            or (isinstance(prefetch, float) and not 0.0 < prefetch <= 1.0)
+        ):
             raise ConfigError("prefetch must be an int >= 0 or a fraction in (0, 1]")
         if underrun not in ("hold", "wait"):
             raise ConfigError("underrun must be 'hold' or 'wait'")
@@ -347,9 +323,8 @@ class AsyncController:
         self._collect(state, t, store, block=False)
         if not state.buffer and state.worker is None and not state.stop_buffered:
             self._dispatch(policy, observation, t, state, store)
-        if not state.buffer and state.worker is not None:
-            if state.last is None or self._hold_data(policy, state) is None:
-                self._collect(state, t, store, block=True)
+        if not state.buffer and state.worker is not None and not self._can_hold(policy, state):
+            self._collect(state, t, store, block=True)
         while state.buffer and state.buffer[0][0] < t:
             _, dropped = state.buffer.popleft()
             state.stale_actions += 1
@@ -358,11 +333,14 @@ class AsyncController:
             _, action = state.buffer.popleft()
             state.last = action
         else:
-            hold = self._hold_data(policy, state)
-            if hold is None:
-                from abstract_harness.robot.core.errors import PolicyError
-
+            if not self._can_hold(policy, state):
                 raise PolicyError(f"policy {policy.info.name!r} left no action to execute")
+            assert state.last is not None
+            last = np.asarray(state.last.data, dtype=np.float64)
+            semantics = policy.info.action_space.semantics
+            assert semantics is not None
+            absolute = semantics.control_mode in ABSOLUTE_CONTROL_MODES
+            hold = last.copy() if absolute else np.zeros_like(last)
             action = Action(data=hold, meta={"hold": True})
             state.holds += 1
         if state.stop_meta:
@@ -374,14 +352,31 @@ class AsyncController:
             and len(state.buffer) <= self._threshold(state)
         ):
             self._dispatch(policy, observation, t, state, store)
-        store[_REPORT_KEY] = {
+        return action
+
+    def report(self, store: dict[str, Any]) -> dict[str, Any] | None:
+        """The trial's counts, for ``TrialRecord.metadata["controller"]``."""
+        state: _AsyncTrial | None = store.get(_ASYNC_KEY)
+        if state is None:
+            return None
+        return {
             "controller": "async",
             "inferences": state.inferences,
             "holds": state.holds,
             "late_actions": state.late_actions,
             "stale_actions": state.stale_actions,
         }
-        return action
+
+    def last_dispatch(self, store: dict[str, Any]) -> int | None:
+        """The step whose observation last went to the policy: what that step carried
+        (approvals, operator messages, command events) counts as delivered then."""
+        state: _AsyncTrial | None = store.get(_ASYNC_KEY)
+        return state.last_dispatch_t if state is not None else None
+
+    def in_flight(self, store: dict[str, Any]) -> bool:
+        """Whether an inference of this trial is still running on the worker."""
+        state: _AsyncTrial | None = store.get(_ASYNC_KEY)
+        return state is not None and state.worker is not None and state.worker.is_alive()
 
     def end_trial(self, store: dict[str, Any]) -> bool:
         """Wait for an inference still in flight, until its own deadline; ``False`` when
@@ -392,8 +387,6 @@ class AsyncController:
     def prepare_trial(self, policy: Policy) -> None:
         """Before the rollout resets ``policy``: refuse a policy this controller cannot
         drive, and one whose previous inference is still running."""
-        from abstract_harness.robot.core.errors import ConfigError, PolicyError
-
         for hook in ("observe", "transcript_delta"):
             if callable(getattr(policy, hook, None)):
                 raise ConfigError(
@@ -427,17 +420,13 @@ class AsyncController:
             return max(0, math.floor(self.prefetch * state.last_chunk_len))
         return self.prefetch
 
-    def _hold_data(self, policy: Policy, state: _AsyncTrial) -> Any:
-        """What an underrun step sends, or ``None`` when the controller must wait."""
-        if self.underrun == "wait" or state.last is None:
-            return None
-        semantics = policy.info.action_space.semantics
-        if semantics is None:
-            return None
-        last = np.asarray(state.last.data, dtype=np.float64)
-        if semantics.control_mode in ABSOLUTE_CONTROL_MODES:
-            return last.copy()
-        return np.zeros_like(last)
+    def _can_hold(self, policy: Policy, state: _AsyncTrial) -> bool:
+        """Whether an underrun step may hold instead of waiting for the inference."""
+        return (
+            self.underrun == "hold"
+            and state.last is not None
+            and policy.info.action_space.semantics is not None
+        )
 
     def _dispatch(
         self,
@@ -463,12 +452,9 @@ class AsyncController:
         state.worker = threading.Thread(target=run, name="abstract-async-inference", daemon=True)
         state.dispatched_at = self._clock()
         state.last_dispatch_t = t
-        store[_DISPATCH_KEY] = t
         state.worker.start()
 
     def _collect(self, state: _AsyncTrial, t: int, store: dict[str, Any], *, block: bool) -> None:
-        from abstract_harness.robot.core.errors import PolicyError, SafetyAbort
-
         if state.worker is None:
             return
         assert state.dispatched_at is not None

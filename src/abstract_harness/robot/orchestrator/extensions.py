@@ -36,7 +36,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from abstract_harness.robot.core import registry
 from abstract_harness.robot.core.errors import ConfigError
@@ -243,15 +243,10 @@ class ExtensionAPI:
 
 
 def _register_function(spec: str) -> Callable[[ExtensionAPI], Any]:
-    function = registry.registered("extension").get(spec)
-    if function is None:
-        try:
-            function = registry.load_object(spec, default="register")
-        except ConfigError as exc:
-            raise ConfigError(f"extension {exc}") from exc
-    if not callable(function):
-        raise ConfigError(f"extension {spec!r} has no register(harness) function")
-    return cast(Callable[[ExtensionAPI], Any], function)
+    try:
+        return registry.lookup("extension", spec, default="register")
+    except ConfigError as exc:
+        raise ConfigError(f"extension {exc}") from exc
 
 
 def load_extensions(specs: str | Sequence[str] | None) -> ExtensionAPI:

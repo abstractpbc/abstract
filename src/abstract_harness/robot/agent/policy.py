@@ -867,23 +867,17 @@ class LLMAgentPolicy(PolicyBase):
         formatted = template.format(name=self._embodiment_name, budget=self._max_llm_calls)
         if self._pre_check is not None:
             formatted += _PRE_CHECK_PROMPT_CLAUSE
-        docs = self._embodiment_docs
-        if docs is not None and docs.strip():
-            formatted = formatted + "\n\nEmbodiment notes:\n" + docs.strip()
-        if self._max_steps is not None:
-            formatted += (
-                f"\n\nEnvironment step budget:\nYou have {self._max_steps} environment steps "
+        formatted = self._with_context(
+            formatted,
+            None
+            if self._max_steps is None
+            else (
+                f"Environment step budget:\nYou have {self._max_steps} environment steps "
                 "for the trial. Every move tool result reports its step count (e.g. "
                 "`executing move_to over N steps (X.Xs)`). Pace yourself against the "
                 "environment step budget, not only the call budget."
-            )
-        if self._prior_learnings_text is not None:
-            formatted = (
-                formatted
-                + "\n\nNotes from a previous attempt at tasks like this one. They may "
-                + "be wrong or stale; the current observation always wins:\n"
-                + self._prior_learnings_text
-            )
+            ),
+        )
         self._messages = [
             {
                 "role": "system",
@@ -897,6 +891,20 @@ class LLMAgentPolicy(PolicyBase):
         self._usage_totals.clear()
         self._pending = None
         self._revealed.clear()
+
+    def _with_context(self, prompt: str, step_budget: str | None) -> str:
+        """A system prompt plus the embodiment notes, the step budget and prior learnings."""
+        docs = self._embodiment_docs
+        if docs is not None and docs.strip():
+            prompt += "\n\nEmbodiment notes:\n" + docs.strip()
+        if step_budget is not None:
+            prompt += "\n\n" + step_budget
+        if self._prior_learnings_text is not None:
+            prompt += (
+                "\n\nNotes from a previous attempt at tasks like this one. They may be wrong "
+                "or stale; the current observation always wins:\n" + self._prior_learnings_text
+            )
+        return prompt
 
     def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
         """Begin streaming wire attempts for the next trial when enabled."""

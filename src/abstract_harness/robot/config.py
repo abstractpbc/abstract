@@ -447,27 +447,19 @@ class RobotConfig(Record):
             value = value.expanduser()
             return value if value.is_absolute() else base / value
 
-        def located(spec: str) -> str:
-            # A "file.py[:attribute]" reference, like log_root, is relative to this file;
-            # registered and module names stay as they are.
-            target, sep, attribute = spec.rpartition(":")
-            if not sep:
-                target, attribute = spec, ""
-            if not target.endswith(".py"):
-                return spec
-            target = str(absolute(Path(target)).resolve())
-            return f"{target}:{attribute}" if attribute else target
+        # A "file.py[:attribute]" reference, like log_root, is relative to this file.
+        from abstract_harness.robot.core.registry import rebase
 
         rig, store = loaded.rig, loaded.store
         agent, vla = loaded.agent, loaded.vla
         if vla is not None:
-            vla = vla.model_copy(update={"policy": located(vla.policy)})
+            vla = vla.model_copy(update={"policy": rebase(vla.policy, base)})
         if agent is not None:
-            update: dict[str, Any] = {"policy": located(agent.policy)}
+            update: dict[str, Any] = {"policy": rebase(agent.policy, base)}
             extensions = agent.args.get("extensions")
             if isinstance(extensions, str | list):
                 items = extensions.split(",") if isinstance(extensions, str) else extensions
-                entries = [located(entry) for entry in (str(item).strip() for item in items)]
+                entries = [rebase(entry, base) for entry in (str(item).strip() for item in items)]
                 update["args"] = {**agent.args, "extensions": ",".join(e for e in entries if e)}
             agent = agent.model_copy(update=update)
         loaded = loaded.model_copy(update={"agent": agent, "vla": vla})

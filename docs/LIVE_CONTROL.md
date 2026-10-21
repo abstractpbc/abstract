@@ -33,9 +33,9 @@ eval(task, policy, robot, strict_timing=StrictTiming(hz=50, max_consecutive_over
 Step `k` of a trial is dispatched no earlier than `start + k / hz`. A step that misses its
 deadline by more than a tenth of a period is an overrun. The schedule never bursts to
 catch up: a late step restarts the schedule at that step, so the next step still waits
-a full period, and the skipped ticks are counted. Only a step that had time to spare ends a run of consecutive
-overruns, so a loop slightly too slow on every step still reaches the abort limit. Each
-trial's report lands in its metadata under `timing`:
+a full period, and the skipped ticks are counted. Only a step that had time to spare
+ends a run of consecutive overruns, so a loop slightly too slow on every step still
+reaches the abort limit. Each trial's report lands in its metadata under `timing`:
 `hz`, `ticks`, `overruns`, `missed_ticks`, `max_late_ms`, `mean_overrun_late_ms` and
 `effective_hz`.
 
@@ -72,8 +72,9 @@ inference runs. Only `act()` runs on the worker. Policies whose `observe()` or
 models that must see every control observation in order, and the LLM agent. At a
 trial's end, the rollout waits for an inference still in flight, until that inference's
 own deadline, before reading the policy. Before the next trial's `reset()`, it refuses to
-start while one is still running. One that never returns marks the policy abandoned. Use async inference on a paced loop. On an unpaced
-simulator, the loop spins through hold steps while inference runs.
+start while one is still running. One that never returns marks the policy abandoned.
+Use async inference on a paced loop. On an unpaced simulator, the loop spins through
+hold steps while inference runs.
 
 ## Live commands
 
@@ -97,8 +98,9 @@ def locomotion_policy(observation):
 An axis that stops updating returns to its default: a dropped gamepad or network link
 stops a velocity command instead of repeating it forever. A stream with declared axes
 refuses other names and clamps values to their ranges. A stream without declared axes
-accepts any name, drops a value that goes 0.5 s without an update, and joins observations only once it has carried a command. So `serve`'s command channel changes nothing until a client uses it. Each trial starts
-at rest with no queued events. The `end_episode` event ends the trial as the console's
+accepts any name, drops a value that goes 0.5 s without an update, and joins
+observations only once it has carried a command. So `serve`'s command channel changes
+nothing until a client uses it. Each trial starts at rest with no queued events. The `end_episode` event ends the trial as the console's
 Esc does, including while inference is pending on a physical run. Commands are policy
 inputs: they reach the robot only through the policy's actions, which still pass the
 approver chain. A button is not an emergency stop.

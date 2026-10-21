@@ -71,8 +71,7 @@ class Bundled(NamedTuple):
 
     def load(self) -> Callable[..., Any]:
         """Import the module and return the factory."""
-        module, _, attribute = self.value.partition(":")
-        return getattr(importlib.import_module(module), attribute)  # type: ignore[no-any-return]
+        return load_object(self.value)  # type: ignore[no-any-return]
 
 
 def bundled(kind: Kind) -> list[Bundled]:
@@ -216,19 +215,36 @@ def registered(kind: Kind) -> dict[str, Callable[..., Any]]:
     return dict(_FACTORIES[kind])
 
 
+def _split(spec: str, default: str | None) -> tuple[str, str]:
+    target, sep, attribute = spec.rpartition(":")
+    return (target, attribute) if sep else (spec, default or "")
+
+
+def _file(target: str, base: Path | None) -> Path:
+    path = Path(target).expanduser()
+    return (path if path.is_absolute() else (base or Path.cwd()) / path).resolve()
+
+
+def rebase(spec: str, base: Path) -> str:
+    """``spec`` with a ``file.py`` reference made absolute against ``base`` (a config
+    file's directory); registered names and module references are returned unchanged."""
+    target, attribute = _split(spec, None)
+    if not target.endswith(".py"):
+        return spec
+    path = str(_file(target, base))
+    return f"{path}:{attribute}" if attribute else path
+
+
 def load_object(spec: str, *, base: Path | None = None, default: str | None = None) -> Any:
     """Import ``"package.module:attribute"`` or ``"path/to/file.py:attribute"`` (a file
     relative to ``base``, default the working directory). Without ``:attribute``, the
     attribute is ``default``. Raises ``ConfigError``."""
-    target, sep, attribute = spec.rpartition(":")
-    if not sep:
-        target, attribute = spec, default or ""
+    target, attribute = _split(spec, default)
     if not target or not attribute:
         raise ConfigError(f'{spec!r}: expected "module:attribute" or "file.py:attribute"')
     try:
         if target.endswith(".py"):
-            path = Path(target).expanduser()
-            path = (path if path.is_absolute() else (base or Path.cwd()) / path).resolve()
+            path = _file(target, base)
             if not path.is_file():
                 raise ConfigError(f"{spec!r}: no such file {path}")
             unique = f"_abstract_plugin_{abs(hash(str(path)))}"
@@ -256,16 +272,19 @@ def load_object(spec: str, *, base: Path | None = None, default: str | None = No
     return found
 
 
-def lookup(kind: Kind, spec: str, /, *, base: Path | None = None) -> Callable[..., Any]:
+def lookup(
+    kind: Kind, spec: str, /, *, base: Path | None = None, default: str | None = None
+) -> Callable[..., Any]:
     """The factory a string names: a registered name, else ``module:attribute`` or
-    ``file.py:attribute`` (relative to ``base``). Raises ``KeyError`` for an unknown name
-    and ``ConfigError`` for a reference that does not load."""
+    ``file.py:attribute`` (relative to ``base``; a bare module or file names its
+    ``default`` attribute, when given). Raises ``KeyError`` for an unknown name and
+    ``ConfigError`` for a reference that does not load."""
     factories = registered(kind)
     if spec in factories:
         return factories[spec]
-    if ":" not in spec:
+    if ":" not in spec and default is None:
         raise KeyError(f"no {kind} named {spec!r}; available: {sorted(factories)}")
-    factory = load_object(spec, base=base)
+    factory = load_object(spec, base=base, default=default)
     if not callable(factory):
         raise ConfigError(f"{spec!r} is not callable")
     return factory

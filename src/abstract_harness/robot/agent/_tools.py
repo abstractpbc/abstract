@@ -421,7 +421,7 @@ class Toolset:
                 error=("note is required: describe what you observe and why you chose this motion")
             )
 
-        values_key = "targets" if self._absolute else "velocities" if self._drive else "deltas"
+        values_key = self.values_key
         values = arguments.get(values_key)
         if not isinstance(values, dict) or not values:
             return ToolResult(error=f"{values_key} must be a non-empty object of name: value")

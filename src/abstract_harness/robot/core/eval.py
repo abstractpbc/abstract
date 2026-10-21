@@ -52,7 +52,7 @@ from abstract_harness.robot.core.rollout import TrialRecord, derive_seed, rollou
 from abstract_harness.robot.core.scene import Scene
 from abstract_harness.robot.core.scorer import Score, get_reducer, reduce_scores, value_to_float
 from abstract_harness.robot.core.task import Task
-from abstract_harness.robot.core.timing import StrictTiming, resolve_strict_timing
+from abstract_harness.robot.core.timing import StrictTiming, trial_timing
 from abstract_harness.robot.core.transcript import judgement_source
 
 if TYPE_CHECKING:
@@ -541,7 +541,7 @@ def _run_eval(
     if callable(policy_bind_task):
         policy_bind_task(task_envelope)
 
-    timing, timing_hz, timing_auto = _strict_timing_for(policy, embodiment, strict_timing)
+    timing, timing_hz, timing_auto = trial_timing(policy, embodiment, strict_timing)
     if commands is not None:
         commands.start()
 
@@ -928,31 +928,6 @@ def _run_eval(
     if cancelled_exc is not None:
         raise cancelled_exc
     return [log]
-
-
-def _strict_timing_for(
-    policy: Policy, embodiment: Embodiment, strict_timing: bool | StrictTiming
-) -> tuple[StrictTiming | None, float, bool]:
-    """The trial pacing for this eval: (config, tick rate, enabled automatically)."""
-    from abstract_harness.robot.core.embodiment import SELF_PACED
-
-    timing = resolve_strict_timing(strict_timing)
-    auto = False
-    if (
-        timing is None
-        and getattr(policy, "requires_paced_loop", False) is True
-        and SELF_PACED not in embodiment.info.capabilities
-    ):
-        timing, auto = StrictTiming(), True
-    if timing is None:
-        return None, 0.0, False
-    hz = timing.hz or embodiment.info.control_hz or policy.info.control_hz
-    if hz is None:
-        raise ConfigError(
-            f"strict timing needs a tick rate, and embodiment {embodiment.info.name!r} "
-            "declares no control_hz; pass StrictTiming(hz=...)"
-        )
-    return timing, float(hz), auto
 
 
 def _should_fail(fail_on_error: bool | float, errors: int, trials: int) -> bool:

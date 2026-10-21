@@ -11,7 +11,8 @@ Additive and opt-in: without the new settings, runs, logs and the public API beh
   dropping, late playback of wholly stale chunks, stop requests that survive both, and
   hold-on-underrun; refuses `observe()`/`transcript_delta()` policies; the rollout joins
   an in-flight inference before reading or resetting the policy (optional controller
-  `end_trial` hook) and counts events delivered at dispatch (`_DISPATCH_KEY`).
+  `end_trial` hook) and counts events delivered at dispatch (optional `last_dispatch`
+  and `report` controller hooks).
 - Live commands (`core/command_stream.py`): `CommandStream` axes with ranges and deadman
   timeouts plus events, fed by a Linux gamepad, UDP, `robot run --commands/--commands-fd`
   and serve's new `command` RPC; injected as `extra["commands"]` and
