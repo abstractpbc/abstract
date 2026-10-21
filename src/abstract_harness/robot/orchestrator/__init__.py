@@ -10,7 +10,6 @@ config, ``[agent] policy = "orchestrator"`` with ``extensions`` in ``[agent.args
 from __future__ import annotations
 
 from abstract_harness.robot.orchestrator.extensions import (
-    ENTRY_POINT_GROUP,
     ExtensionAPI,
     ToolSpec,
     load_extensions,
@@ -33,7 +32,6 @@ from abstract_harness.robot.orchestrator.policy import (
 )
 
 __all__ = [
-    "ENTRY_POINT_GROUP",
     "Behavior",
     "ExtensionAPI",
     "Job",

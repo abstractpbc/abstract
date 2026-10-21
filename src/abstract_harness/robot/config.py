@@ -113,10 +113,16 @@ class AgentPricing(Pricing):
     cache_write_per_million: Nonnegative | None = None
 
 
+# A registered policy name, or "module:attribute" / "file.py:attribute" (relative to the
+# config file) for an unregistered policy factory.
+PolicyName = Annotated[str, Field(min_length=1, max_length=300, pattern=r"^\S+$")]
+
+
 class AgentConfig(Record):
-    # "agent" drives the robot through its motion tools; "orchestrator" runs extension
-    # tools (trained policies, skills) as background jobs and watches their events.
-    policy: Literal["agent", "orchestrator"] = "agent"
+    # A metered LLM policy: "agent" drives the robot through its motion tools;
+    # "orchestrator" runs extension tools (trained policies, skills) as background jobs
+    # and watches their events; any other policy that takes the agent's arguments.
+    policy: PolicyName = "agent"
     model: Annotated[str, Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9._:-]+$")]
     pricing: AgentPricing
     # OpenAI bills a request with more input tokens than this at long-context rates. The
@@ -175,12 +181,17 @@ class AgentConfig(Record):
         return {**self.args, **pinned}
 
 
+# The action-policy clients that always talk to a server (unless "policy" runs a local
+# `target`); any other [vla] policy gets server_url only when the config sets one.
+SERVER_CLIENTS = ("policy", "molmoact2", "gr00t")
+
+
 class ActionPolicyConfig(Record):
     """An action policy (VLA or World-Action Model) on a cloud `/v1` gateway, a local
-    `/v1` or `/act` server, or an in-process local model (`target` in `args`)."""
+    `/v1` or `/act` server, or an in-process local model (`target` in `args`), or any
+    other registered action policy, such as `teleop`."""
 
-    # "teleop" maps live commands (a preset's gamepad) onto the action; it has no server.
-    policy: Literal["policy", "molmoact2", "gr00t", "teleop"] = "policy"
+    policy: PolicyName = "policy"
     server_url: str = "https://api.abstract.inc/v1"
     # The policy client's arguments other than server_url, e.g. model, target, or camera size.
     args: Args = Field(default_factory=dict)
@@ -192,15 +203,7 @@ class ActionPolicyConfig(Record):
         if PROTECTED_VLA_ARGS & set(self.args):
             raise ValueError("[vla.args] cannot set server_url; set it in [vla]")
         _check_args("vla.args", self.args)
-        if self.policy == "teleop":
-            if "server_url" in self.model_fields_set:
-                raise ValueError('[vla] policy = "teleop" has no server_url')
-            return self
-        if (
-            self.policy == "policy"
-            and "target" in self.args
-            and "server_url" not in self.model_fields_set
-        ):
+        if self.endpoint is None:
             return self
         url = urlparse(self.server_url)
         allowed_paths = ("", "/", "/v1", "/v1/") if self.policy == "policy" else ("", "/")
@@ -218,17 +221,17 @@ class ActionPolicyConfig(Record):
 
     @property
     def endpoint(self) -> str | None:
-        """Where the policy's actions come from: its server, or None for teleop."""
-        return None if self.policy == "teleop" else self.server_url
+        """The server the policy's actions come from, or None for one that runs here."""
+        explicit = "server_url" in self.model_fields_set
+        if self.policy not in SERVER_CLIENTS:
+            return self.server_url if explicit else None
+        if self.policy == "policy" and "target" in self.args and not explicit:
+            return None
+        return self.server_url
 
     def policy_args(self) -> dict[str, Scalar | list[Scalar]]:
-        if self.policy == "teleop" or (
-            self.policy == "policy"
-            and "target" in self.args
-            and "server_url" not in self.model_fields_set
-        ):
-            return dict(self.args)
-        return {**self.args, "server_url": self.server_url}
+        endpoint = self.endpoint
+        return dict(self.args) if endpoint is None else {**self.args, "server_url": endpoint}
 
 
 VlaConfig = ActionPolicyConfig
@@ -444,25 +447,30 @@ class RobotConfig(Record):
             value = value.expanduser()
             return value if value.is_absolute() else base / value
 
+        def located(spec: str) -> str:
+            # A "file.py[:attribute]" reference, like log_root, is relative to this file;
+            # registered and module names stay as they are.
+            target, sep, attribute = spec.rpartition(":")
+            if not sep:
+                target, attribute = spec, ""
+            if not target.endswith(".py"):
+                return spec
+            target = str(absolute(Path(target)).resolve())
+            return f"{target}:{attribute}" if attribute else target
+
         rig, store = loaded.rig, loaded.store
-        agent = loaded.agent
-        extensions = agent.args.get("extensions") if agent is not None else None
-        if agent is not None and isinstance(extensions, str | list):
-            # Extension files, like log_root, are relative to this file; module names stay.
-            items = extensions.split(",") if isinstance(extensions, str) else extensions
-            resolved = []
-            for entry in (str(item).strip() for item in items):
-                target, sep, attribute = entry.rpartition(":")
-                if not sep:
-                    target, attribute = entry, ""
-                if target.endswith(".py"):
-                    target = str(absolute(Path(target)).resolve())
-                    entry = f"{target}:{attribute}" if attribute else target
-                if entry:
-                    resolved.append(entry)
-            args = {**agent.args, "extensions": ",".join(resolved)}
-            agent = agent.model_copy(update={"args": args})
-            loaded = loaded.model_copy(update={"agent": agent})
+        agent, vla = loaded.agent, loaded.vla
+        if vla is not None:
+            vla = vla.model_copy(update={"policy": located(vla.policy)})
+        if agent is not None:
+            update: dict[str, Any] = {"policy": located(agent.policy)}
+            extensions = agent.args.get("extensions")
+            if isinstance(extensions, str | list):
+                items = extensions.split(",") if isinstance(extensions, str) else extensions
+                entries = [located(entry) for entry in (str(item).strip() for item in items)]
+                update["args"] = {**agent.args, "extensions": ",".join(e for e in entries if e)}
+            agent = agent.model_copy(update=update)
+        loaded = loaded.model_copy(update={"agent": agent, "vla": vla})
         rig_update: dict[str, Any] = {"log_root": absolute(rig.log_root)}
         if rig.preset is not None:
             rig_update["preset"] = absolute(rig.preset)

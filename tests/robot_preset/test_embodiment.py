@@ -250,6 +250,37 @@ def test_a_driver_file_next_to_the_preset_loads(tmp_path: Path) -> None:
     assert not arm.simulated and arm._factory.__name__ == "Mine"
 
 
+def test_a_driver_registered_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    from abstract_harness.robot.core import registry
+    from abstract_harness.robot.preset import PresetError
+
+    class Toy(SimDriver):
+        pass
+
+    registry.registered("driver")  # load the registry first, as a lookup does
+    monkeypatch.setitem(registry._FACTORIES["driver"], "toy", Toy)
+    assert PresetEmbodiment(str(ARM), driver="toy")._factory is Toy
+    with pytest.raises(PresetError, match="no driver named 'tyo'.*'sim'"):
+        PresetEmbodiment(str(ARM), driver="tyo")
+
+
+def test_joint_velocity_guardrails_include_the_acceleration_limit(tmp_path: Path) -> None:
+    shutil.copy(ARM.parent / "mobile_manipulator.urdf", tmp_path)
+    (tmp_path / "vel.toml").write_text(
+        '[robot]\nname = "vel"\nmodel = "mobile_manipulator.urdf"\npolicy_hz = 20\n'
+        'mode = "joint_vel"\n[robot.joints]\nselect = ["arm_j1", "arm_j2"]\n'
+        "max_accel = { arm_j1 = 4.0 }\n"
+    )
+    arm = PresetEmbodiment(str(tmp_path / "vel.toml"))
+    approver, active, _ = build_guardrails(arm.info.action_space, None, arm)
+    assert active[-1] == "accel-limit"
+    store: dict[str, Any] = {}
+    approver.begin_trial(None, store)
+    first = approver.review(Action(data=np.array([1.0, 1.0])), store)
+    # 4 rad/s^2 at 20 Hz: 0.2 rad/s per step from rest; arm_j2 has no limit.
+    np.testing.assert_allclose(first.data, [0.2, 1.0])
+
+
 class BrokenRead(FakeRobot):
     def read(self) -> dict[str, Any]:
         return {"joint_pos": np.zeros(3)}
@@ -365,15 +396,24 @@ def test_rig_preset_errors(tmp_path: Path, rig: str, message: str) -> None:
         RobotConfig.load(path)
 
 
-def test_teleop_refuses_a_server_url(tmp_path: Path) -> None:
-    from pydantic import ValidationError
+def test_a_local_vla_policy_gets_a_server_url_only_when_the_config_sets_one(
+    tmp_path: Path,
+) -> None:
+    from abstract_harness.robot.core.registry import resolve
 
     path = tmp_path / "rig.toml"
+    path.write_text(f'[vla]\npolicy = "teleop"\n[rig]\npreset = "{BASE}"\n')
+    config = RobotConfig.load(path)
+    assert config.vla is not None and config.vla.endpoint is None
+    assert "server_url" not in config.policy_args()
     path.write_text(
         f'[vla]\npolicy = "teleop"\nserver_url = "http://h:1"\n[rig]\npreset = "{BASE}"\n'
     )
-    with pytest.raises(ValidationError, match="has no server_url"):
-        RobotConfig.load(path)
+    config = RobotConfig.load(path)
+    assert config.vla is not None and config.vla.endpoint == "http://h:1"
+    # Teleop has no server: the policy refuses the argument when it is built.
+    with pytest.raises(TypeError, match="server_url"):
+        resolve("policy", config.policy_name, **config.policy_args())
 
 
 def test_the_shipped_teleop_rig_probes_without_hardware() -> None:

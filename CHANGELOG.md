@@ -27,6 +27,12 @@ Additive and opt-in: without the new settings, runs, logs and the public API beh
 - The orchestrator (`robot/orchestrator`, policy `orchestrator`, `[agent] policy =
   "orchestrator"`): extension tools, packaged policies and skills, run as background jobs
   whose events wake the model, with `wait`, `stop_job`, `steer_job` and `jobs`.
+- One naming rule for components, plus installed plugins (`core/registry.py`). A name is
+  a registered name, `module:attribute` or `file.py:attribute`. The rule covers
+  `--policy`, a rig's `[vla]`/`[agent]` `policy`, a preset's `driver` and controller
+  `kind`, and orchestrator `extensions`. `abstract_harness.plugins` entry points register
+  policies, embodiments, drivers, command sources and extensions. Presets also gain
+  layout tables for gamepads and a `joint_vel` acceleration limit.
 - `reference_state_keys` prefers the state field named after the control mode, so a
   `joint_pos` embodiment may also report a same-shaped `joint_vel`.
 - `abstract robot holdcheck|health|pose` refuse rigs that are not `yam_arms`.

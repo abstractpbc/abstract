@@ -16,7 +16,7 @@ from abstract_harness.robot.preset.description import (
     RobotDescription,
     load_preset,
 )
-from abstract_harness.robot.preset.driver import RobotDriver, SimDriver, load_driver_factory
+from abstract_harness.robot.preset.driver import RobotDriver, SimDriver
 from abstract_harness.robot.preset.embodiment import FALL, PresetEmbodiment
 from abstract_harness.robot.preset.model import ModelError, ModelJoint, RobotModel, load_model
 
@@ -31,7 +31,6 @@ __all__ = [
     "RobotDriver",
     "RobotModel",
     "SimDriver",
-    "load_driver_factory",
     "load_model",
     "load_preset",
 ]

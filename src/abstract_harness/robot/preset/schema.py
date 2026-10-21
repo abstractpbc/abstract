@@ -56,6 +56,8 @@ class JointsSection(Record):
     # Glob -> the largest per-step change (joint_pos: rad or m per step; joint_delta:
     # the per-step bound itself).
     max_step: dict[Glob, Annotated[float, Field(gt=0)]] = Field(default_factory=dict)
+    # joint_vel: glob -> the largest change of velocity per second (rad/s^2 or m/s^2).
+    max_accel: dict[Glob, Annotated[float, Field(gt=0)]] = Field(default_factory=dict)
     # Glob -> the reset pose; joints left out stay where they are at reset.
     home: dict[Glob, Number] = Field(default_factory=dict)
     home_secs: Annotated[float, Field(gt=0, le=60)] = 3.0
@@ -197,14 +199,32 @@ class ButtonActionDecl(Record):
         return self
 
 
+class LayoutDecl(Record):
+    """A gamepad's button and axis names, by index, for a pad the built-in layouts miss."""
+
+    buttons: dict[Name, Annotated[int, Field(ge=0, le=1023)]] = Field(default_factory=dict)
+    axes: dict[Name, Annotated[int, Field(ge=0, le=1023)]] = Field(default_factory=dict)
+
+
+#: Controller kinds the preset schema knows the fields of; any other kind is a
+#: registered command source, "module:attribute" or "file.py:attribute" taking ``args``.
+BUILTIN_CONTROLLERS = ("joystick", "udp")
+_JOYSTICK_FIELDS = {"device", "layout", "deadman", "refresh_hz", "max_silence_s", "axes", "buttons"}
+_UDP_FIELDS = {"host", "port", "allow_remote"}
+
+
 class ControllerDecl(Record):
     """An external input device and what each of its inputs does."""
 
     name: Name
-    kind: Literal["joystick", "udp"]
+    # "joystick" (Linux /dev/input/js*), "udp" (JSON datagrams), or another command
+    # source: a registered name, "module:attribute" or "file.py:attribute" (relative to
+    # the preset), constructed with ``args``.
+    kind: Annotated[str, Field(min_length=1, max_length=300)]
     # joystick
     device: str = "/dev/input/js0"
-    layout: Literal["xbox", "raw"] = "xbox"
+    # "xbox", "raw" (indices only), or a table of button and axis names.
+    layout: Literal["xbox", "raw"] | LayoutDecl = "xbox"
     deadman: StrictInt | Name | None = None
     refresh_hz: Annotated[float, Field(gt=0, le=1000)] = 50.0
     # Opt-in: after this long without any pad event, sticks publish rest (a wireless pad
@@ -219,22 +239,18 @@ class ControllerDecl(Record):
     host: str = "127.0.0.1"
     port: Annotated[int, Field(ge=1, le=65535)] = 9870
     allow_remote: StrictBool = False
+    # Other kinds: the source factory's keyword arguments.
+    args: dict[Name, Scalar | list[Scalar]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def kind_fields(self) -> Self:
-        joystick = {
-            "device",
-            "layout",
-            "deadman",
-            "refresh_hz",
-            "max_silence_s",
-            "axes",
-            "buttons",
-        }
-        udp = {"host", "port", "allow_remote"}
-        wrong = (udp if self.kind == "joystick" else joystick) & self.model_fields_set
-        if wrong:
-            raise ValueError(f"controller {self.name}: {sorted(wrong)} are not {self.kind} fields")
+        allowed = {"joystick": _JOYSTICK_FIELDS, "udp": _UDP_FIELDS}.get(self.kind, {"args"})
+        wrong = (_JOYSTICK_FIELDS | _UDP_FIELDS | {"args"}) - allowed
+        if wrong & self.model_fields_set:
+            raise ValueError(
+                f"controller {self.name}: {sorted(wrong & self.model_fields_set)} are not "
+                f"{self.kind} fields"
+            )
         return self
 
 

@@ -17,12 +17,13 @@ import tomllib
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
 from pydantic import ValidationError
 
+from abstract_harness.robot.core import registry
 from abstract_harness.robot.core.command_stream import (
     END_EPISODE,
     LAYOUTS,
@@ -49,6 +50,7 @@ from abstract_harness.robot.core.spaces import (
 )
 from abstract_harness.robot.preset.model import ModelError, ModelJoint, RobotModel, load_model
 from abstract_harness.robot.preset.schema import (
+    BUILTIN_CONTROLLERS,
     KNOWN_STATE,
     ButtonActionDecl,
     CameraDecl,
@@ -113,6 +115,9 @@ class RobotDescription:
     # the action bounds (steps, velocities) do not cover.
     position_limits: tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None = None
     command_timeout_s: float = 0.25
+    # Rate modes: each dimension's largest change per second (None: unlimited), from
+    # [robot.base] or [robot.joints] max_accel; None when neither sets one.
+    max_accel: tuple[float | None, ...] | None = None
 
     @property
     def dim(self) -> int:
@@ -246,7 +251,7 @@ class RobotDescription:
             for axis in section.commands
         ]
         events = section.command_events or None
-        sources = [_controller_source(decl, axes) for decl in section.controllers]
+        sources = [_controller_source(decl, self.path.parent) for decl in section.controllers]
         return CommandStream(axes, events=events, sources=sources)
 
     def summary(self) -> str:
@@ -290,39 +295,53 @@ class RobotDescription:
         return "\n".join(lines)
 
 
-def _button_index(key: str | int, layout: str, controller: str) -> int:
+def _layout(decl: ControllerDecl) -> tuple[str, dict[str, dict[str, int]]]:
+    """The controller's layout: its name for messages, and its button and axis names."""
+    if isinstance(decl.layout, str):
+        return decl.layout, LAYOUTS.get(decl.layout, {})
+    return "table", {"buttons": dict(decl.layout.buttons), "axes": dict(decl.layout.axes)}
+
+
+def _index(key: str | int, decl: ControllerDecl, what: str) -> int:
     if isinstance(key, int):
         return key
-    if key.isdigit():
+    if what == "button" and key.isdigit():
         return int(key)
-    names = LAYOUTS.get(layout, {}).get("buttons", {})
-    if key not in names:
+    layout, names = _layout(decl)
+    table = names.get("axes" if what == "axis" else "buttons", {})
+    if key not in table:
         raise PresetError(
-            f"controller {controller}: unknown button {key!r} for layout {layout!r}"
-            f"{_suggest(key, set(names))}"
+            f"controller {decl.name}: unknown {what} {key!r} for layout {layout!r}"
+            f"{_suggest(key, set(table))}"
         )
-    return names[key]
+    return table[key]
 
 
-def _axis_index(key: str | int, layout: str, controller: str) -> int:
-    if isinstance(key, int):
-        return key
-    names = LAYOUTS.get(layout, {}).get("axes", {})
-    if key not in names:
+def _source_factory(decl: ControllerDecl, base: Path) -> Any:
+    try:
+        return registry.lookup("command_source", decl.kind, base=base)
+    except KeyError as exc:
         raise PresetError(
-            f"controller {controller}: unknown axis {key!r} for layout {layout!r}"
-            f"{_suggest(key, set(names))}"
-        )
-    return names[key]
+            f"controller {decl.name}: {exc.args[0]} (built in: {', '.join(BUILTIN_CONTROLLERS)})"
+        ) from None
+    except ConfigError as exc:
+        raise PresetError(f"controller {decl.name}: {exc}") from exc
 
 
-def _controller_source(decl: ControllerDecl, axes: list[AxisSpec]) -> CommandSource:
+def _controller_source(decl: ControllerDecl, base: Path) -> CommandSource:
     if decl.kind == "udp":
         return UdpCommandSource(decl.host, decl.port, allow_remote=decl.allow_remote)
+    if decl.kind != "joystick":
+        source = _source_factory(decl, base)(**decl.args)
+        if not (
+            callable(getattr(source, "start", None)) and callable(getattr(source, "close", None))
+        ):
+            raise PresetError(f"controller {decl.name}: {decl.kind!r} built no command source")
+        return cast(CommandSource, source)
     bindings = [
         AxisBinding(
             command,
-            axis=_axis_index(binding.axis, decl.layout, decl.name),
+            axis=_index(binding.axis, decl, "axis"),
             scale=float(binding.scale),
             deadzone=binding.deadzone,
         )
@@ -330,7 +349,7 @@ def _controller_source(decl: ControllerDecl, axes: list[AxisSpec]) -> CommandSou
     ]
     buttons = []
     for key, action in decl.buttons.items():
-        index = _button_index(key, decl.layout, decl.name)
+        index = _index(key, decl, "button")
         if isinstance(action, ButtonActionDecl):
             buttons.append(
                 ButtonBinding(
@@ -339,9 +358,7 @@ def _controller_source(decl: ControllerDecl, axes: list[AxisSpec]) -> CommandSou
             )
         else:
             buttons.append(ButtonBinding(index, event=action))
-    deadman = (
-        _button_index(decl.deadman, decl.layout, decl.name) if decl.deadman is not None else None
-    )
+    deadman = _index(decl.deadman, decl, "button") if decl.deadman is not None else None
     return JoystickSource(
         decl.device,
         axes=bindings,
@@ -520,7 +537,7 @@ def _state_fields(section: RobotSection, joints: list[ModelJoint]) -> tuple[Stat
     return tuple(fields)
 
 
-def _check_commands(section: RobotSection) -> None:
+def _check_commands(section: RobotSection, base: Path) -> None:
     declared = {axis.name for axis in section.commands}
     events = set(section.command_events) | {END_EPISODE}
     for axis in section.commands:
@@ -549,11 +566,13 @@ def _check_commands(section: RobotSection) -> None:
                         )
         if controller.kind == "joystick":
             for binding in controller.axes.values():
-                _axis_index(binding.axis, controller.layout, controller.name)
+                _index(binding.axis, controller, "axis")
             for key in controller.buttons:
-                _button_index(key, controller.layout, controller.name)
+                _index(key, controller, "button")
             if controller.deadman is not None:
-                _button_index(controller.deadman, controller.layout, controller.name)
+                _index(controller.deadman, controller, "button")
+        elif controller.kind not in BUILTIN_CONTROLLERS:
+            _source_factory(controller, base)  # a typo fails here, before any run
 
 
 def load_preset(path: Path | str) -> RobotDescription:
@@ -585,8 +604,15 @@ def load_preset(path: Path | str) -> RobotDescription:
         max_step: tuple[float | None, ...] | None = None
         home = None
         parts: tuple[str, ...] | None = ("base",) * len(labels)
-        if section.joints.select or section.joints.limits or section.joints.home:
+        joints_table = section.joints
+        if (
+            joints_table.select
+            or joints_table.limits
+            or joints_table.home
+            or joints_table.max_accel
+        ):
             raise PresetError('mode = "base_vel" drives the base only; drop [robot.joints]')
+        accels: dict[str, float] = dict(section.base.max_accel)
     else:
         joints = _select_joints(section, model)
         names = [joint.name for joint in joints]
@@ -606,6 +632,9 @@ def load_preset(path: Path | str) -> RobotDescription:
                     )
         elif section.mode == "joint_vel" and steps:
             raise PresetError("joint_vel limits velocities, not steps; drop max_step")
+        accels = _per_joint(section.joints.max_accel, names, "max_accel")
+        if accels and section.mode != "joint_vel":
+            raise PresetError('[robot.joints] max_accel limits velocities; it needs "joint_vel"')
         home_values = _per_joint(section.joints.home, names, "home")
         home = None
         if home_values:
@@ -654,7 +683,7 @@ def load_preset(path: Path | str) -> RobotDescription:
         if sensor.frame is not None:
             _frame(sensor.frame, model, f"sensor {sensor.name}")
     state_fields = _state_fields(section, joints)
-    _check_commands(section)
+    _check_commands(section, path.parent)
     position_limits = None
     if section.mode in ("joint_delta", "joint_vel"):
         # Their [robot.joints] limits bound steps or velocities; positions keep the model's.
@@ -686,6 +715,7 @@ def load_preset(path: Path | str) -> RobotDescription:
         driver_args=dict(section.driver_args),
         position_limits=position_limits,
         command_timeout_s=section.command_timeout,
+        max_accel=tuple(accels.get(label) for label in labels) if accels else None,
     )
 
 

@@ -3,18 +3,34 @@
 Components register by name via decorators and are resolved from strings (so
 ``eval(policy="scripted")`` and the CLI work). The core's own components load on the
 first lookup, then the bundled ones: the agent and YAM components in the harness's other
-robot packages (``BUNDLED``), whose optional dependencies may be missing. A bundled
-component that fails to import is skipped with a warning.
+robot packages (``BUNDLED``), whose optional dependencies may be missing, then installed
+plugins: every ``abstract_harness.plugins`` entry point is imported, and its decorators
+register what it provides. A bundled component or plugin that fails to import is skipped
+with a warning.
+
+Wherever a component is named by a string (``--policy``, a rig's ``[vla] policy``, a
+preset's ``driver``, a controller's ``kind``, an orchestrator extension), the string is a
+registered name, or ``"package.module:attribute"`` or ``"path/to/file.py:attribute"`` for
+an unregistered factory (``lookup``).
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import sys
 import warnings
 from collections.abc import Callable
+from importlib.metadata import entry_points
+from pathlib import Path
 from typing import Any, NamedTuple, TypeVar
 
-Kind = str  # "task" | "policy" | "embodiment" | "scorer" | "grader" | "sink" | "operator_input"
+from abstract_harness.robot.core.errors import ConfigError
+
+# "task" | "policy" | "embodiment" | "scorer" | "grader" | "sink" | "operator_input" |
+# "driver" (a robot preset's hardware driver) | "command_source" (a preset controller's
+# live input) | "extension" (a function that registers orchestrator tools)
+Kind = str
 KINDS: tuple[Kind, ...] = (
     "task",
     "policy",
@@ -23,7 +39,12 @@ KINDS: tuple[Kind, ...] = (
     "grader",
     "sink",
     "operator_input",
+    "driver",
+    "command_source",
+    "extension",
 )
+#: The entry-point group of installed plugins: each entry point names a module to import.
+PLUGIN_GROUP = "abstract_harness.plugins"
 
 # Components of the harness's agent and YAM packages, as "module:attribute".
 BUNDLED: dict[Kind, dict[str, str]] = {
@@ -35,6 +56,9 @@ BUNDLED: dict[Kind, dict[str, str]] = {
     "embodiment": {
         "yam_arms": "abstract_harness.robot.yam.embodiment:YAMEmbodiment",
         "preset": "abstract_harness.robot.preset.embodiment:PresetEmbodiment",
+    },
+    "driver": {
+        "sim": "abstract_harness.robot.preset.driver:SimDriver",
     },
 }
 
@@ -59,6 +83,7 @@ def bundled(kind: Kind) -> list[Bundled]:
 _FACTORIES: dict[Kind, dict[str, Callable[..., Any]]] = {k: {} for k in KINDS}
 _loaded_bundled = False
 _loaded_builtins = False
+_loaded_plugins = False
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -113,8 +138,42 @@ def operator_input(name: str | None = None) -> Callable[[F], F]:
     return register("operator_input", name)
 
 
+def driver(name: str | None = None) -> Callable[[F], F]:
+    """Decorator: register a robot-preset driver factory under ``name``."""
+    return register("driver", name)
+
+
+def command_source(name: str | None = None) -> Callable[[F], F]:
+    """Decorator: register a live-command source factory (a controller ``kind``)."""
+    return register("command_source", name)
+
+
+def extension(name: str | None = None) -> Callable[[F], F]:
+    """Decorator: register an orchestrator extension (``register(harness)``) under ``name``."""
+    return register("extension", name)
+
+
+def _load_plugins() -> None:
+    before = {kind: dict(factories) for kind, factories in _FACTORIES.items()}
+    for ep in entry_points(group=PLUGIN_GROUP):
+        try:
+            ep.load()
+        except Exception as exc:
+            warnings.warn(
+                f"failed to load plugin {ep.name!r} from {ep.value!r}: {exc!r}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+    for kind, factories in before.items():
+        for name, factory in factories.items():
+            if _FACTORIES[kind].get(name) is not factory:
+                warnings.warn(
+                    f"a plugin replaced the {kind} {name!r}", RuntimeWarning, stacklevel=3
+                )
+
+
 def _ensure_loaded() -> None:
-    global _loaded_builtins, _loaded_bundled
+    global _loaded_builtins, _loaded_bundled, _loaded_plugins
     if not _loaded_builtins:
         # Set the flag only once the import has succeeded: a raising import that
         # left it set would make every later call take the "already loaded" path
@@ -138,6 +197,15 @@ def _ensure_loaded() -> None:
                     continue
                 _FACTORIES[kind].setdefault(ep.name, factory)
         _loaded_bundled = True
+    if not _loaded_plugins:
+        # Set first, so a plugin that looks a component up while importing does not
+        # re-enter; cleared again if the scan itself raises, so the next call retries.
+        _loaded_plugins = True
+        try:
+            _load_plugins()
+        except BaseException:
+            _loaded_plugins = False
+            raise
 
 
 def registered(kind: Kind) -> dict[str, Callable[..., Any]]:
@@ -148,9 +216,61 @@ def registered(kind: Kind) -> dict[str, Callable[..., Any]]:
     return dict(_FACTORIES[kind])
 
 
-def resolve(kind: Kind, name: str, /, **kwargs: Any) -> Any:
-    """Construct a registered component by name with the given keyword args."""
+def load_object(spec: str, *, base: Path | None = None, default: str | None = None) -> Any:
+    """Import ``"package.module:attribute"`` or ``"path/to/file.py:attribute"`` (a file
+    relative to ``base``, default the working directory). Without ``:attribute``, the
+    attribute is ``default``. Raises ``ConfigError``."""
+    target, sep, attribute = spec.rpartition(":")
+    if not sep:
+        target, attribute = spec, default or ""
+    if not target or not attribute:
+        raise ConfigError(f'{spec!r}: expected "module:attribute" or "file.py:attribute"')
+    try:
+        if target.endswith(".py"):
+            path = Path(target).expanduser()
+            path = (path if path.is_absolute() else (base or Path.cwd()) / path).resolve()
+            if not path.is_file():
+                raise ConfigError(f"{spec!r}: no such file {path}")
+            unique = f"_abstract_plugin_{abs(hash(str(path)))}"
+            module = sys.modules.get(unique)
+            if module is None:
+                module_spec = importlib.util.spec_from_file_location(unique, path)
+                if module_spec is None or module_spec.loader is None:
+                    raise ConfigError(f"{spec!r}: cannot load {path}")
+                module = importlib.util.module_from_spec(module_spec)
+                sys.modules[unique] = module
+                try:
+                    module_spec.loader.exec_module(module)
+                except BaseException:
+                    del sys.modules[unique]
+                    raise
+        else:
+            module = importlib.import_module(target)
+    except ConfigError:
+        raise
+    except Exception as exc:
+        raise ConfigError(f"{spec!r}: import failed: {type(exc).__name__}: {exc}") from exc
+    found = getattr(module, attribute, None)
+    if found is None:
+        raise ConfigError(f"{spec!r}: {target} has no {attribute}")
+    return found
+
+
+def lookup(kind: Kind, spec: str, /, *, base: Path | None = None) -> Callable[..., Any]:
+    """The factory a string names: a registered name, else ``module:attribute`` or
+    ``file.py:attribute`` (relative to ``base``). Raises ``KeyError`` for an unknown name
+    and ``ConfigError`` for a reference that does not load."""
     factories = registered(kind)
-    if name not in factories:
-        raise KeyError(f"no {kind} named {name!r}; available: {sorted(factories)}")
-    return factories[name](**kwargs)
+    if spec in factories:
+        return factories[spec]
+    if ":" not in spec:
+        raise KeyError(f"no {kind} named {spec!r}; available: {sorted(factories)}")
+    factory = load_object(spec, base=base)
+    if not callable(factory):
+        raise ConfigError(f"{spec!r} is not callable")
+    return factory
+
+
+def resolve(kind: Kind, name: str, /, **kwargs: Any) -> Any:
+    """Construct a component by name (or ``module:attribute``) with the given keyword args."""
+    return lookup(kind, name)(**kwargs)

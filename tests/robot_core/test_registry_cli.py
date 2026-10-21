@@ -95,6 +95,68 @@ def test_entrypoint_discovery_retries_after_a_failed_scan(
     assert len(calls) == 2
 
 
+def test_plugins_register_through_their_entry_point(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Plugin:
+        def __init__(self, name: str, value: str, load: Any) -> None:
+            self.name, self.value, self.load = name, value, load
+
+    class Replacement(ScriptedPolicy):
+        pass
+
+    def good() -> None:
+        reg.register("policy", "plugin_made")(ScriptedPolicy)
+        reg.register("policy", "scripted")(Replacement)  # replaces a built-in
+
+    def broken() -> None:
+        raise ImportError("no such dependency")
+
+    reg.registered("policy")  # load everything else first
+    monkeypatch.setattr(reg, "_FACTORIES", {k: dict(v) for k, v in reg._FACTORIES.items()})
+    monkeypatch.setattr(
+        reg,
+        "entry_points",
+        lambda group: [_Plugin("good", "pkg.good", good), _Plugin("bad", "pkg.bad", broken)],
+    )
+    monkeypatch.setattr(reg, "_loaded_plugins", False)
+    with pytest.warns(RuntimeWarning) as caught:
+        names = registered("policy")
+    assert "plugin_made" in names
+    messages = [str(w.message) for w in caught]
+    assert any("failed to load plugin 'bad'" in m for m in messages)
+    assert any("replaced the policy 'scripted'" in m for m in messages)
+
+
+def test_a_failed_plugin_scan_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    def exploding(group: str) -> list[object]:
+        raise RuntimeError("broken metadata")
+
+    reg.registered("policy")
+    monkeypatch.setattr(reg, "entry_points", exploding)
+    monkeypatch.setattr(reg, "_loaded_plugins", False)
+    with pytest.raises(RuntimeError, match="broken metadata"):
+        reg._ensure_loaded()
+    assert reg._loaded_plugins is False
+
+
+def test_lookup_takes_names_modules_and_files(tmp_path: Path) -> None:
+    from abstract_harness.robot.core.errors import ConfigError
+
+    assert reg.lookup("policy", "scripted") is registered("policy")["scripted"]
+    made = reg.lookup("policy", "abstract_harness.robot.core.mock:ScriptedPolicy")
+    assert made is ScriptedPolicy
+    (tmp_path / "mine.py").write_text("def make(**kwargs):\n    return kwargs\n\nvalue = 3\n")
+    assert reg.lookup("policy", "mine.py:make", base=tmp_path)(a=1) == {"a": 1}
+    assert resolve("policy", f"{tmp_path / 'mine.py'}:make", b=2) == {"b": 2}
+    with pytest.raises(ConfigError, match="not callable"):
+        reg.lookup("policy", "mine.py:value", base=tmp_path)
+    with pytest.raises(ConfigError, match="has no other"):
+        reg.lookup("policy", "mine.py:other", base=tmp_path)
+    with pytest.raises(ConfigError, match="import failed"):
+        reg.lookup("policy", "no_such_module_anywhere:thing")
+    with pytest.raises(KeyError, match="no policy named 'scriptd'"):
+        reg.lookup("policy", "scriptd")
+
+
 def test_builtin_loading_retries_after_a_failed_import(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

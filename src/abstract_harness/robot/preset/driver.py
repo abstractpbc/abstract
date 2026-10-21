@@ -3,10 +3,12 @@
 A driver is the only code that talks to a preset robot's hardware (or vendor SDK). The
 preset embodiment owns the lifecycle, pacing, the readiness gates, the watchdog, fall
 detection and observation assembly; every action it hands the driver has already
-passed the approver chain. A driver is constructed as
-``factory(description, **driver_args)`` (``RobotDescription`` holds joint names in
-action order, limits, rates, end effectors and cameras) and its constructor must not
-open hardware: ``connect()`` does. The methods:
+passed the approver chain. A preset names its driver as a registered name (``"sim"``,
+or one an installed plugin registers with ``@registry.driver``), ``"module:Class"`` or
+``"file.py:Class"``. A driver is constructed as ``factory(description, **driver_args)``
+(``RobotDescription`` holds joint names in action order, limits, rates, end effectors
+and cameras) and its constructor must not open hardware: ``connect()`` does. The
+methods:
 
 ``connect()``
     Open the robot: ports, SDK sessions, enabling. Called once, at the first reset.
@@ -31,13 +33,9 @@ guardrail requirements).
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import math
-import sys
-from collections.abc import Callable, Mapping
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
@@ -71,39 +69,6 @@ class RobotDriver(Protocol):
     def close(self) -> None:
         """Release the hardware."""
         ...
-
-
-def load_driver_factory(spec: str, base: Path) -> Callable[..., Any]:
-    """``"sim"``, ``"package.module:Class"``, or ``"path/to/file.py:Class"`` (relative to
-    the preset's directory) to the driver factory."""
-    if spec == "sim":
-        return SimDriver
-    module_name, sep, attribute = spec.rpartition(":")
-    if not sep or not module_name or not attribute:
-        raise ConfigError(
-            f'driver {spec!r}: expected "sim", "module:attribute" or "file.py:attribute"'
-        )
-    try:
-        if module_name.endswith(".py"):
-            file = Path(module_name)
-            file = file if file.is_absolute() else base / file
-            unique = f"_abstract_preset_driver_{abs(hash(str(file.resolve())))}"
-            module_spec = importlib.util.spec_from_file_location(unique, file)
-            if module_spec is None or module_spec.loader is None:
-                raise ConfigError(f"driver {spec!r}: cannot load {file}")
-            module = importlib.util.module_from_spec(module_spec)
-            sys.modules[unique] = module
-            module_spec.loader.exec_module(module)
-        else:
-            module = importlib.import_module(module_name)
-    except ConfigError:
-        raise
-    except Exception as exc:
-        raise ConfigError(f"driver {spec!r}: import failed: {type(exc).__name__}: {exc}") from exc
-    factory = getattr(module, attribute, None)
-    if not callable(factory):
-        raise ConfigError(f"driver {spec!r}: {module_name} has no callable {attribute!r}")
-    return cast(Callable[..., Any], factory)
 
 
 # Base command labels the simulator understands, by axis.

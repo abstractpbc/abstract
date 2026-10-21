@@ -68,8 +68,9 @@ def register(harness: ExtensionAPI) -> None:
 ```
 
 Name the extensions in `extensions`, separated by commas: a file (`./skills/kitchen.py`),
-a module (`my_pkg.kitchen`), `module:function` for another registration function, or the
-name of an installed package's `abstract_harness.extensions` entry point. Extensions
+a module (`my_pkg.kitchen`), `module:function` for another registration function, or a
+name registered with `@registry.extension("kitchen")`. An installed plugin package
+provides an extension that way ([ADAPTERS.md](ADAPTERS.md)). Extensions
 load when the orchestrator is constructed, before anything moves. Each policy tool's
 policy is built and bound once, when the orchestrator binds to the robot, and checked
 for compatibility with the dimensions it drives. A mismatch is refused at startup.

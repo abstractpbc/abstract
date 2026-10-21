@@ -25,7 +25,7 @@ what the driver must not decide alone:
   position limits is cut to stop at the limit.
 
 Every action reaching the driver has passed the approver chain: the bounds clamp, the
-per-step limit, and for ``base_vel`` the acceleration limit from ``max_accel``.
+per-step limit, and for rate modes the acceleration limit from ``max_accel``.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from abstract_harness.robot.core import registry
 from abstract_harness.robot.core.approver import AccelerationLimitApprover, GuardrailContribution
 from abstract_harness.robot.core.command_stream import CommandStream
 from abstract_harness.robot.core.embodiment import EmbodimentBase
@@ -49,8 +50,7 @@ from abstract_harness.robot.core.scene import Scene
 from abstract_harness.robot.core.spaces import RATE_CONTROL_MODES, Box
 from abstract_harness.robot.core.timing import Pacer
 from abstract_harness.robot.core.types import Action, Observation, StepResult
-from abstract_harness.robot.preset.description import RobotDescription, load_preset
-from abstract_harness.robot.preset.driver import load_driver_factory
+from abstract_harness.robot.preset.description import PresetError, RobotDescription, load_preset
 
 FALL = "fall_detected"
 
@@ -83,10 +83,15 @@ class PresetEmbodiment(EmbodimentBase):
         self.description: RobotDescription = load_preset(preset)
         section = self.description.section
         self.driver_spec = driver or section.driver
-        self._factory = load_driver_factory(self.driver_spec, self.description.path.parent)
-        self.simulated = (
-            self.driver_spec == "sim" or getattr(self._factory, "simulated", False) is True
-        )
+        try:
+            self._factory = registry.lookup(
+                "driver", self.driver_spec, base=self.description.path.parent
+            )
+        except KeyError as exc:
+            raise PresetError(f"driver: {exc.args[0]}") from None
+        except ConfigError as exc:
+            raise PresetError(f"driver: {exc}") from exc
+        self.simulated = getattr(self._factory, "simulated", False) is True
         paced = _flag(pace, "pace")
         self._pace = section.pace if paced is None else paced
         started = _flag(auto_start, "auto_start")
@@ -132,16 +137,14 @@ class PresetEmbodiment(EmbodimentBase):
         return self.description.command_stream()
 
     def contribute_guardrails(self, action_space: Box) -> GuardrailContribution:
-        """The acceleration limit for a base with ``max_accel``."""
-        base = self.description.section.base
-        if self.description.mode != "base_vel" or base is None or not base.max_accel:
+        """The acceleration limit, for a rate mode with ``max_accel``."""
+        limits = self.description.max_accel
+        if limits is None:
             return GuardrailContribution()
         span = self.description.high - self.description.low
         per_step = [
-            base.max_accel[label] / self.description.policy_hz
-            if label in base.max_accel
-            else float(span[index]) or 1.0
-            for index, label in enumerate(self.description.labels)
+            limit / self.description.policy_hz if limit is not None else float(span[index]) or 1.0
+            for index, limit in enumerate(limits)
         ]
         approver = AccelerationLimitApprover(action_space, per_step, rest=self._take_rest)
         self._accel_limited = True

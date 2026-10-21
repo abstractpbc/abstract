@@ -276,6 +276,115 @@ def test_udp_controllers_take_udp_fields_only(tmp_path: Path) -> None:
         load_preset(write(tmp_path, body))
 
 
+class Remote:
+    """A command source a controller kind names: it records what it was built with."""
+
+    def __init__(self, **args: object) -> None:
+        self.args = args
+
+    def start(self, stream: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_controller_kind_names_any_command_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from abstract_harness.robot.core import registry
+
+    (tmp_path / "remote.py").write_text(
+        "class Remote:\n"
+        "    def __init__(self, **args):\n        self.args = args\n"
+        "    def start(self, stream):\n        pass\n"
+        "    def close(self):\n        pass\n"
+    )
+    registry.registered("command_source")  # load the registry first, as a lookup does
+    monkeypatch.setitem(registry._FACTORIES["command_source"], "remote", Remote)
+    body = (
+        '[robot.joints]\nselect = ["arm_j1"]\n'
+        '[[robot.controllers]]\nname = "a"\nkind = "remote"\n'
+        "[robot.controllers.args]\nchannel = 3\n"
+        '[[robot.controllers]]\nname = "b"\nkind = "remote.py:Remote"\n'
+    )
+    stream = load_preset(write(tmp_path, body)).command_stream()
+    assert stream is not None
+    first, second = stream._sources
+    assert isinstance(first, Remote) and first.args == {"channel": 3}
+    assert type(second).__name__ == "Remote" and second.args == {}  # type: ignore[attr-defined]
+    stream.close()
+
+
+@pytest.mark.parametrize(
+    ("controller", "message"),
+    [
+        ('kind = "remot"\n', "no command_source named 'remot'.*built in: joystick, udp"),
+        ('kind = "nowhere.py:Remote"\n', "no such file"),
+        ('kind = "remote"\ndevice = "/dev/input/js1"\n', "are not remote fields"),
+        ('kind = "joystick"\n[robot.controllers.args]\nx = 1\n', "are not joystick fields"),
+        ('kind = "not_a_source"\n', "built no command source"),
+    ],
+)
+def test_custom_controller_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, controller: str, message: str
+) -> None:
+    from abstract_harness.robot.core import registry
+
+    registry.registered("command_source")
+    monkeypatch.setitem(registry._FACTORIES["command_source"], "remote", Remote)
+    monkeypatch.setitem(registry._FACTORIES["command_source"], "not_a_source", dict)
+    body = '[robot.joints]\nselect = ["arm_j1"]\n[[robot.controllers]]\nname = "c"\n' + controller
+    with pytest.raises(PresetError, match=message):
+        description = load_preset(write(tmp_path, body))
+        description.command_stream()
+
+
+def test_a_layout_table_names_a_pads_buttons_and_axes(tmp_path: Path) -> None:
+    body = """
+    command_events = ["go"]
+    [robot.joints]
+    select = ["arm_j1"]
+    [[robot.commands]]
+    name = "vx"
+    [[robot.controllers]]
+    name = "pad"
+    kind = "joystick"
+    deadman = "l1"
+    [robot.controllers.layout]
+    buttons = { cross = 0, l1 = 9 }
+    axes = { left_y = 1 }
+    [robot.controllers.axes]
+    vx = { axis = "left_y" }
+    [robot.controllers.buttons]
+    cross = "go"
+    """
+    stream = load_preset(write(tmp_path, body)).command_stream()
+    assert stream is not None
+    (pad,) = stream._sources
+    assert isinstance(pad, JoystickSource)
+    assert pad.deadman == 9 and pad.axes[0].axis == 1 and sorted(pad.buttons) == [0]
+    stream.close()
+    with pytest.raises(PresetError, match="unknown button 'a' for layout 'table'"):
+        load_preset(write(tmp_path, body.replace('cross = "go"', 'a = "go"')))
+
+
+def test_joint_velocity_acceleration_limits(tmp_path: Path) -> None:
+    description = load_preset(
+        write(
+            tmp_path,
+            'mode = "joint_vel"\n[robot.joints]\nselect = ["arm_j1", "claw_joint"]\n'
+            'max_accel = { "arm_*" = 4.0 }\n',
+        )
+    )
+    assert description.max_accel == (4.0, None)
+    with pytest.raises(PresetError, match="max_accel limits velocities"):
+        load_preset(
+            write(tmp_path, '[robot.joints]\nselect = ["arm_j1"]\nmax_accel = { arm_j1 = 1.0 }\n')
+        )
+    assert load_preset(write(tmp_path, '[robot.joints]\nselect = ["arm_j1"]\n')).max_accel is None
+
+
 G1_JOINTS = [
     *(
         f"{side}_{name}"

@@ -51,7 +51,7 @@ model = "g1_29dof.urdf"        # URDF or MJCF, relative to the preset (optional 
 policy_hz = 50                 # the policy step rate: EmbodimentInfo.control_hz
 control_hz = 500               # the driver's servo rate, passed to the driver (default policy_hz)
 mode = "joint_pos"             # joint_pos | joint_delta | joint_vel | base_vel
-driver = "g1_driver.py:G1Driver"   # "sim", "module:Class" or "file.py:Class" (relative to the preset)
+driver = "g1_driver.py:G1Driver"   # "sim", a registered driver, "module:Class" or "file.py:Class"
 pace = true                    # step() waits out the policy period (default true)
 auto_start = false             # physical drivers: skip the readiness gates (a notice prints)
 command_timeout_s = 0.25       # rate modes: the watchdog's timeout (at least two policy periods)
@@ -71,6 +71,7 @@ names or globs:
 | `exclude` | Joints to drop from the selection. |
 | `limits` | `glob = [low, high]` in the mode's units. Narrows the model's limits, and supplies them where the model has none (a continuous joint). A preset can never widen a limit. |
 | `max_step` | `glob = value`: the largest change per step. For `joint_pos` it becomes `ActionSemantics.max_step` (the delta limiter's budget). For `joint_delta` it is the per-step bound itself and is required for every joint. |
+| `max_accel` | `joint_vel` only: `glob = value`, the largest change of velocity per second. It becomes the acceleration limit, as for a base. |
 | `home`, `home_secs` | The reset pose and the ramp's duration (`joint_pos` only). Joints left out stay where they are. |
 
 `[[robot.joint]]` declares joints the model lacks, such as a custom end effector's
@@ -144,7 +145,8 @@ max_tilt_deg = 30                             # fall detection
 
 - The **acceleration limit** is an `AccelerationLimitApprover` in the guardrail chain,
   shown as `accel-limit`. It caps each step's change at `max_accel / policy_hz`, starting
-  from rest. Stopping ramps too.
+  from rest. Stopping ramps too. `joint_vel` presets get the same limit from
+  `[robot.joints] max_accel`.
 - The **watchdog** stops the driver when no step arrives within `command_timeout_s`
   (here or in `[robot]`; at least two policy periods). Examples are slow synchronous
   inference or a stalled loop. The next step resumes motion, and the acceleration limit
@@ -196,7 +198,29 @@ port = 9870                  # loopback; host and allow_remote for a trusted net
 ```
 
 The `xbox` layout follows the Linux xpad driver. Its buttons are `a b x y lb rb back
-start guide ls rs`, and its axes are `lx ly lt rx ry rt dx dy`.
+start guide ls rs`, and its axes are `lx ly lt rx ry rt dx dy`. For another pad, name its
+inputs in a table:
+
+```toml
+[robot.controllers.layout]
+buttons = { cross = 0, circle = 1, l1 = 4 }
+axes = { left_x = 0, left_y = 1 }
+```
+
+Any other `kind` is a command source of your own. Give it as a registered name, as
+`"module:Class"`, or as `"file.py:Class"` relative to the preset. Examples are a vendor's
+wireless remote, a ROS topic, or a gamepad API on another platform.
+`factory(**args)` builds it from its `[robot.controllers.args]` table. It must have
+`start(stream)` and `close()` (`CommandSource` in `core/command_stream.py`). It writes
+with `stream.update(...)` and `stream.press(...)`:
+
+```toml
+[[robot.controllers]]
+name = "remote"
+kind = "g1_remote.py:WirelessRemote"
+[robot.controllers.args]
+network_interface = "eth0"
+```
 
 ## Drivers
 
@@ -235,6 +259,11 @@ before the home ramp (once per connection) and once before the episode starts.
 Without an attended terminal, a physical preset refuses to reset, before connecting
 anything, unless it sets `auto_start = true`, which prints a notice instead. A driver whose
 `connect()` fails is closed. Keep someone at the hardware stop.
+
+A plugin package can register its driver with `@registry.driver("my_robot")`. A preset
+then names it `driver = "my_robot"` ([ADAPTERS.md](ADAPTERS.md)). A robot whose parts sit
+on separate buses still has one driver, and that driver composes the parts. For
+example, its `command()` splits the action by `description.parts`.
 
 `driver = "sim"` is the built-in `SimDriver`, a kinematic stand-in with no physics.
 Joint targets track with an optional lag (`tau_s`), deltas and velocities integrate, a

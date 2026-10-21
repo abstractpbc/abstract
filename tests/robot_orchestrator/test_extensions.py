@@ -65,7 +65,7 @@ def test_the_example_extension_registers_two_tools() -> None:
     assert "instruction" in reach.parameters["properties"]
 
 
-def test_extensions_load_from_modules_functions_and_entry_points(
+def test_extensions_load_from_modules_functions_and_registered_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = type(sys)("my_tools")
@@ -81,15 +81,11 @@ def test_extensions_load_from_modules_functions_and_entry_points(
     monkeypatch.setitem(sys.modules, "my_tools", module)
     assert sorted(load_extensions("my_tools, my_tools:other").tools) == ["one", "two"]
 
-    class EntryPoint:
-        name = "kitchen"
+    # A registered extension (what an installed plugin does with @registry.extension).
+    from abstract_harness.robot.core import registry
 
-        def load(self) -> Any:
-            return other
-
-    from abstract_harness.robot.orchestrator import extensions
-
-    monkeypatch.setattr(extensions, "entry_points", lambda group: [EntryPoint()])
+    registry.registered("extension")  # load the registry first, as a lookup does
+    monkeypatch.setitem(registry._FACTORIES["extension"], "kitchen", other)
     assert list(load_extensions(["kitchen"]).tools) == ["two"]
 
 

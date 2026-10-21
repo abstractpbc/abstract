@@ -810,7 +810,7 @@ def check(args: argparse.Namespace) -> int:
         report("doctor", code == 0, "\n".join(tail))
         if vla is not None:
             ok, detail, warning = vla_probe_result(stack.vla_probe(config))
-            report(f"vla:{vla.policy}", ok, f"{vla.endpoint or 'live commands'}: {detail}", warning)
+            report(f"vla:{vla.policy}", ok, f"{vla.endpoint or 'in process'}: {detail}", warning)
     if installed and agent is not None:
         report("rehearsal", *rehearse(config))
     if config.store is not None:
@@ -900,7 +900,7 @@ def _run(args: argparse.Namespace) -> int:
         episode_args["command_sources"] = command_sources
     if vla is not None:
         write_setup(config, log_dir / SETUP, None, policy_overrides, embodiment_overrides)
-        announce(f"{vla.policy} at {vla.endpoint or 'live commands'}")
+        announce(f"{vla.policy} at {vla.endpoint or 'in process'}")
         code = stack.episode(config, instruction, log_dir, **episode_args)
         summary: dict[str, Any] = {"policy": vla.policy, "server_url": vla.endpoint}
         summary_file, failed = "run-summary.json", code

@@ -107,7 +107,7 @@ Sources:
 
 | Source | How |
 | --- | --- |
-| A preset's controllers | `[[robot.controllers]]` ([PRESETS.md](PRESETS.md)): a Linux gamepad (`/dev/input/js*`, no extra dependency), with deadzones, scales, a deadman button and button actions, or a UDP bridge. |
+| A preset's controllers | `[[robot.controllers]]` ([PRESETS.md](PRESETS.md)) can be a Linux gamepad (`/dev/input/js*`, no extra dependency) with deadzones, scales, a deadman button and button actions. It can also be a UDP bridge or any command source of your own. |
 | UDP | `--commands udp:127.0.0.1:9870` on `abstract eval` and `abstract robot run`. One JSON datagram per message: `{"values": {"vx": 0.3}, "events": ["go"]}`, or `{"vx": 0.3}`. Loopback only unless the source is built with `allow_remote=True`. |
 | HTTP | `abstract robot serve`'s `command` RPC ([RPC.md](RPC.md)), forwarded to the run through `robot run --commands-fd`. |
 | Python | `stream.set("vx", 0.3)`, `stream.update({...})`, `stream.press("go")`, or a `CommandSource` with `start(stream)` and `close()`; pass `eval(..., commands=stream)`. |

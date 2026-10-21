@@ -27,22 +27,18 @@ module may register any number of tools::
 Extensions load when the orchestrator is constructed, before any robot moves, and their
 tools appear in the model's context. Name them in ``extensions`` (comma-separated):
 a module path (``my_pkg.kitchen``), a file (``./skills/kitchen.py``), ``module:function``
-for another registration function, or the name of an installed package's
-``abstract_harness.extensions`` entry point.
+for another registration function, or a name registered with ``@registry.extension``
+(how an installed plugin package provides one; see ``core/registry.py``).
 """
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import re
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from importlib.metadata import entry_points
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from abstract_harness.robot.core import registry
 from abstract_harness.robot.core.errors import ConfigError
 
 if TYPE_CHECKING:
@@ -51,7 +47,6 @@ if TYPE_CHECKING:
     from abstract_harness.robot.core.types import Observation
     from abstract_harness.robot.orchestrator.jobs import JobContext
 
-ENTRY_POINT_GROUP = "abstract_harness.extensions"
 TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 #: Names the orchestrator itself uses for its control and built-in motion tools.
 RESERVED = frozenset(
@@ -248,28 +243,12 @@ class ExtensionAPI:
 
 
 def _register_function(spec: str) -> Callable[[ExtensionAPI], Any]:
-    target, sep, attribute = spec.rpartition(":")
-    if not sep:
-        target, attribute = spec, ""
-    function: Any
-    if target.endswith(".py"):
-        path = Path(target).expanduser()
-        if not path.is_file():
-            raise ConfigError(f"extension {spec!r}: no such file {path}")
-        unique = f"_abstract_extension_{abs(hash(str(path.resolve())))}"
-        module_spec = importlib.util.spec_from_file_location(unique, path)
-        if module_spec is None or module_spec.loader is None:
-            raise ConfigError(f"extension {spec!r}: cannot load {path}")
-        module = importlib.util.module_from_spec(module_spec)
-        sys.modules[unique] = module
-        module_spec.loader.exec_module(module)
-        function = getattr(module, attribute or "register", None)
-    else:
-        named = [ep for ep in entry_points(group=ENTRY_POINT_GROUP) if ep.name == spec]
-        if named and not sep:
-            function = named[0].load()
-        else:
-            function = getattr(importlib.import_module(target), attribute or "register", None)
+    function = registry.registered("extension").get(spec)
+    if function is None:
+        try:
+            function = registry.load_object(spec, default="register")
+        except ConfigError as exc:
+            raise ConfigError(f"extension {exc}") from exc
     if not callable(function):
         raise ConfigError(f"extension {spec!r} has no register(harness) function")
     return cast(Callable[[ExtensionAPI], Any], function)
